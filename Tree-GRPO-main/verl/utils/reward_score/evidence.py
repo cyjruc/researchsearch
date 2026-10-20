@@ -50,6 +50,39 @@ def _dedup_preserve_order(ids: Iterable[Optional[str]]) -> list[str]:
     return out
 
 
+def extract_doc_ids_from_retrieval(result) -> list[str]:
+    """从 Wiki 检索原始返回中提取稳定 ``document.id``，按返回顺序保序。
+
+    Wiki 后端返回形状（见 docs/researchsearch/retrieval-contract.md §4.3）：
+
+        [{"document": {"id": "wiki:123", "contents": "标题\\n正文"}, "score": 0.8}, ...]
+
+    Agent 观察由 ``_passages2string`` 拼成 ``Doc N(Title: ...) ...``，``document.id``
+    在该处被丢弃。树内证据接线需要旁路保留每个搜索实际返回的文档 ID，因此本函数
+    直接从原始 ``result`` 取 ``document.id``，供 :func:`compute_evidence_reward`
+    的 ``visible_doc_ids`` / ``retrieval_hit_doc_ids`` 与 Recall@K 复用。
+
+    Args:
+        result: 单个查询的 Wiki 检索原始返回（``result[i]`` 是文档列表）。
+
+    Returns:
+        list[str]: 按返回顺序的 doc_id；缺失、非字符串或空 id 跳过，不补齐。
+    """
+    ids: list[str] = []
+    if not isinstance(result, list):
+        return ids
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        doc = item.get("document")
+        if not isinstance(doc, dict):
+            continue
+        doc_id = doc.get("id")
+        if isinstance(doc_id, str) and doc_id.strip():
+            ids.append(doc_id.strip())
+    return ids
+
+
 def compute_evidence_reward(
     gold_doc_ids: Iterable[str],
     visible_doc_ids: Iterable[str],
@@ -109,4 +142,49 @@ def compute_evidence_reward(
         "gold_doc_ids": gold,
         "visible_doc_ids": visible,
         "retrieval_hit_doc_ids": retrieval_hit,
+    }
+
+
+def compute_recall_at_k(
+    gold_doc_ids: Iterable[str],
+    retrieved_doc_ids: Iterable[str],
+    k: int,
+) -> dict:
+    """按检索顺序去重后取前 K 计算 Recall@K（架构 §4 检索指标口径）。
+
+    与 :func:`compute_evidence_reward` 的区别：证据奖励只统计「截断后仍进入
+    Agent 观察」的文档，而 Recall@K 是模型无关的检索召回评测指标，统计后端
+    返回文档（按检索顺序去重后取前 K）对 gold 的覆盖率。
+
+    Args:
+        gold_doc_ids: 金标准支持文档 ID。
+        retrieved_doc_ids: 检索返回的文档 ID，按检索顺序（可跨多次检索累计）。
+        k: 截断位置，去重后取前 ``k`` 个；``k <= 0`` 视为空集。
+
+    Returns:
+        dict：``recall``（0~1，gold 为空时为 0.0）、``num_gold``、
+        ``num_retrieved``（参与计算的前 K 个去重文档数）、``num_hit``、
+        ``truncated_doc_ids``。
+    """
+    gold = _dedup_preserve_order(gold_doc_ids)
+    deduped = _dedup_preserve_order(retrieved_doc_ids)
+    truncated = deduped[:k] if k > 0 else []
+
+    if not gold:
+        return {
+            "recall": 0.0,
+            "num_gold": 0,
+            "num_retrieved": len(truncated),
+            "num_hit": 0,
+            "truncated_doc_ids": truncated,
+        }
+
+    gold_set = set(gold)
+    hit = [doc_id for doc_id in truncated if doc_id in gold_set]
+    return {
+        "recall": len(hit) / len(gold),
+        "num_gold": len(gold),
+        "num_retrieved": len(truncated),
+        "num_hit": len(hit),
+        "truncated_doc_ids": truncated,
     }

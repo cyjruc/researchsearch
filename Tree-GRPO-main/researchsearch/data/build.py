@@ -40,6 +40,11 @@ EVIDENCE_STATUSES = ("mapped", "partial", "unmapped", "not_available")
 DEFAULT_ABILITY = "fact-reasoning"
 DEFAULT_ENVIRONMENT = "wiki"
 
+# FlashRAG 数据源的 split 选择：train 用官方 train，dev 用官方 dev（独立划分）。
+# 正式 test split 锁定，dev 数据源不得消费 test（方案 §4.1「正式测试集锁定」）。
+_TRAIN_FLASHRAG_SPLIT = "train"
+_DEV_FLASHRAG_SPLIT = "dev"
+
 _UNWANTED_QUESTION_CHARS = re.compile(r"[^\w\s]", re.UNICODE)
 _WHITESPACE = re.compile(r"\s+")
 
@@ -394,11 +399,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             parser.error("--flashrag-dir 必须与 --train-flashrag / --dev-flashrag 一起提供")
         for data_source in _split_sources(args.train_flashrag):
             train_records.extend(
-                load_flashrag_source(args.flashrag_dir, data_source, "train", source_revision=args.source_revision)
+                load_flashrag_source(args.flashrag_dir, data_source, _TRAIN_FLASHRAG_SPLIT, source_revision=args.source_revision)
             )
         for data_source in _split_sources(args.dev_flashrag):
             dev_records.extend(
-                load_flashrag_source(args.flashrag_dir, data_source, "test", source_revision=args.source_revision)
+                load_flashrag_source(args.flashrag_dir, data_source, _DEV_FLASHRAG_SPLIT, source_revision=args.source_revision)
             )
 
     if not train_records and not dev_records:

@@ -97,3 +97,43 @@ def test_dedup_preserves_order_and_filters_invalid():
     assert r["visible_doc_ids"] == ["wiki:b", "wiki:a"]
     assert r["gold_doc_ids"] == ["wiki:b", "wiki:a"]
     assert r["score"] == pytest.approx(1.0)
+
+
+# --- Recall@K（架构 §4 检索指标，去重后取前 K） ------------------------------
+
+
+def test_recall_at_k_full_coverage():
+    r = evidence.compute_recall_at_k(["wiki:a", "wiki:b"], ["wiki:a", "wiki:b"], k=2)
+    assert r["recall"] == pytest.approx(1.0)
+    assert r["num_retrieved"] == 2
+    assert r["num_hit"] == 2
+
+
+def test_recall_at_k_truncates_after_dedup():
+    # 口径：按检索顺序去重后取前 K，重复项不占用 K 的名额。
+    # retrieved=["a","a","b"] 去重后 ["a","b"]，k=2 命中全部 gold。
+    r = evidence.compute_recall_at_k(["wiki:a", "wiki:b"], ["wiki:a", "wiki:a", "wiki:b"], k=2)
+    assert r["recall"] == pytest.approx(1.0)
+    assert r["truncated_doc_ids"] == ["wiki:a", "wiki:b"]
+
+
+def test_recall_at_k_ordering_matters():
+    # 只统计进入前 K 的文档，超出 K 的命中不计入。
+    r = evidence.compute_recall_at_k(["wiki:a", "wiki:b"], ["wiki:x", "wiki:a"], k=1)
+    assert r["recall"] == pytest.approx(0.0)
+    assert r["num_retrieved"] == 1
+    assert r["truncated_doc_ids"] == ["wiki:x"]
+
+
+def test_recall_at_k_empty_gold_no_divide_by_zero():
+    r = evidence.compute_recall_at_k([], ["wiki:a", "wiki:b"], k=5)
+    assert r["recall"] == pytest.approx(0.0)
+    assert r["num_gold"] == 0
+
+
+def test_recall_at_k_k_zero_or_negative_is_empty():
+    r = evidence.compute_recall_at_k(["wiki:a"], ["wiki:a"], k=0)
+    assert r["recall"] == pytest.approx(0.0)
+    assert r["num_retrieved"] == 0
+    r2 = evidence.compute_recall_at_k(["wiki:a"], ["wiki:a"], k=-1)
+    assert r2["num_retrieved"] == 0

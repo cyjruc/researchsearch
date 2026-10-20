@@ -3,12 +3,18 @@
 对齐方案 T01（数据隔离与分组 ID）以及 §4.2 的样本结构约定。
 """
 
+import sys
+import types
+
 import pytest
 
 from researchsearch.data.build import (
     EVIDENCE_STATUSES,
+    _DEV_FLASHRAG_SPLIT,
+    _TRAIN_FLASHRAG_SPLIT,
     build_dataset,
     build_sample,
+    load_flashrag_source,
     normalize_question,
 )
 
@@ -191,3 +197,41 @@ def test_manifest_consistent_with_samples():
 def test_evidence_statuses_enum_unchanged():
     # 防止意外改动破坏方案 §4.2 约定的四种状态
     assert EVIDENCE_STATUSES == ("mapped", "partial", "unmapped", "not_available")
+
+
+# --- FlashRAG split 选择（方案 §4.1「正式测试集锁定」） ------------------------
+
+
+def test_flashrag_split_constants_never_use_test():
+    # dev 数据源只能取官方 dev（或回退 train），绝不消费 test split。
+    assert _TRAIN_FLASHRAG_SPLIT == "train"
+    assert _DEV_FLASHRAG_SPLIT == "dev"
+
+
+def test_load_flashrag_dev_prefers_dev_over_test(monkeypatch):
+    # dev 数据源传入 "dev" 时，即使数据集同时有 test，也只取 dev split。
+    rows = {
+        "train": [{"id": "t0", "question": "train question?", "golden_answers": ["t"]}],
+        "dev": [{"id": "d0", "question": "dev question?", "golden_answers": ["d"]}],
+        "test": [{"id": "x0", "question": "test question?", "golden_answers": ["x"]}],
+    }
+    fake = types.ModuleType("datasets")
+    fake.load_dataset = lambda dataset_dir, data_source: rows
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+
+    records = load_flashrag_source("/tmp/x", "hotpotqa", _DEV_FLASHRAG_SPLIT)
+    assert [r["question"] for r in records] == ["dev question?"]
+
+
+def test_load_flashrag_dev_falls_back_to_train_not_test(monkeypatch):
+    # 数据集无 dev split 时回退 train（配合泄漏检测兜底），绝不落到 test。
+    rows = {
+        "train": [{"id": "t0", "question": "train question?", "golden_answers": ["t"]}],
+        "test": [{"id": "x0", "question": "test question?", "golden_answers": ["x"]}],
+    }
+    fake = types.ModuleType("datasets")
+    fake.load_dataset = lambda dataset_dir, data_source: rows
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+
+    records = load_flashrag_source("/tmp/x", "hotpotqa", _DEV_FLASHRAG_SPLIT)
+    assert [r["question"] for r in records] == ["train question?"]

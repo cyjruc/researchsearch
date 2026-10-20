@@ -50,6 +50,8 @@
 | train_multihopqa_grpo.sh | 2c048b6584e0a036854c47fd9edc7e1c0b4c613918f15c337cc2cf607c8f572 |
 | train_multihopqa_tree_search.sh | d1dd6b8dda6ffbe7c6c97c72132c56083ea3d2c3ccc213d3cdeb36789807cba0 |
 
+全仓库源码快照（244 个文件，2026-10-20 生成）见 [source-snapshot.md](source-snapshot.md)。
+
 ## 启动预检
 
 预检脚本：scripts/researchsearch/preflight.py。它不会打印凭据值。
@@ -123,26 +125,37 @@ Web 搜索服务使用单独的 retriever 环境。先启动 Redis，设置 BRIG
 - [x] **T07 优势计算**：新增 `tests/researchsearch/test_core_algos.py`（9 项），锁定 grpo 按 index 标准化、tree 默认 = 两次独立标准化相加、tree_2norm = 顺序双重标准化、per-token 池化等语义。
 - [x] **T06 前置静态分析**：新增 `docs/researchsearch/loss-mask.md`，记录 info_mask → `_create_loss_mask` → loss_mask → response_mask → agg_loss 全链路；结论：loss mask 生效前提是 `state_masking=true`（train 脚本与 smoke 启动器均已覆盖）。
 - [x] **数据层迁移收尾**：`data_process_multihop.sh` / `data_process_singlehop.sh` 改为 `python -m researchsearch.data.build`；旧 `qa_search_train_merge.py` / `qa_search_test_merge.py` 标注 deprecated 并指向新入口；下游默认验证集统一为 `dev.parquet`（6 个 train 脚本 + `launch_smoke.sh` + `preflight.py` + `ray_worker_probe.py`）。
+- [x] **客户端检索超时/重试/错误分类**（方案 §2.1 阻塞 6 / §4.3）：新增 `search_r1/search/retrieval_client.py`（`post_retrieve` 单次 30s、最多重试 2 次、指数退避、区分 auth/rate_limit/server/network/invalid），`generation.py` / `generation_ts.py` 的 `_batch_search` 改走该客户端；配套 `tests/researchsearch/test_retrieval_client.py`（16 项）。
+- [x] **全仓库源码快照**（Day 1 任务 2 补全）：新增 `docs/researchsearch/source-snapshot.md`，记录 244 个源码文件 SHA-256（排除 .pytest_cache / __pycache__ / 图片二进制）。
+- [x] **T06 loss mask 单元测试**：新增 `tests/researchsearch/test_loss_mask.py`（6 项），加载真实 `_info_masked_concatenate_with_padding` 与 `TensorHelper.create_attention_mask`，锁定 information → pad_id → mask 0 的构造、`loss_mask = info_mask[:, -response_length:]` 切片与 `state_masking` 开关语义。
+- [x] **树内证据奖励接线预备**（方案 Day 5 任务 6 / Day 6 任务 1 无卡部分）：新增 `docs/researchsearch/evidence-wiring.md`，记录字段传递全链路、三个丢失点（pop 只留 3 字段 / `_passages2string` 丢 doc_id / RewardManager 不读证据）与 Day 6 接线蓝图；新增 `evidence.extract_doc_ids_from_retrieval` 纯函数（旁路提取 Wiki `document.id`）；配套 `tests/researchsearch/test_tree_evidence_wiring.py`（6 项，锁定叶子顺序与 `np.repeat` 行序对齐、doc_id 提取、两题不串题）。核心训练路径改动待真实 rollout 验证。
+- [x] **T07 优势计算路由测试**（方案 Day 5 任务 3）：新增 `tests/researchsearch/test_adv_routing.py`（4 项），加载真实 `ray_trainer_ts.compute_advantage`，锁定 `tree` = 两次 `compute_grpo_outcome_advantage` 相加、`tree_2norm` = 一次 `compute_tree_grpo_outcome_advantage`，二者不同不能混用。
+- [x] **checkpoint 导出参数化**（方案 §6 Day 6 任务 2 / §2.1 阻塞 4）：新增 `scripts/researchsearch/export_ckpt.sh`，通过自身目录定位 `model_merger.py`，参数化 `LOCAL_DIR` / `TARGET_DIR` / `HF_MODEL_PATH` / `BACKEND`，支持 `--dry-run`；旧 `convert_checkpoint_from_verl_to_hf.sh` 标注 deprecated 并指向新脚本；配套 `tests/researchsearch/test_export_ckpt.py`（5 项，缺参数提前失败、dry-run 路径解析、hf_model_path 仅按需透传）。真实合并/加载与确定性推理一致性检查待真实 checkpoint（GPU 阶段）。
+- [x] **Day 1–7 一致性审计修复**（对齐方案 §4.1 / 架构 §4）：① 修正 `build.py` 的 `--dev-flashrag` 错误消费 FlashRAG `test` split（违背「正式测试集锁定」），改为 `_DEV_FLASHRAG_SPLIT="dev"`，并补 3 项测试锁定 dev 优先 dev split、无 dev 回退 train、绝不落 test；② 新增 `evidence.compute_recall_at_k` 纯函数（架构 §4 检索指标：按检索顺序去重后取前 K）+ 5 项测试；③ 补 `test_loss_mask.py` tree 版（`generation_ts`，含 `turns_mask`/`turns`）掩码构造 4 项测试，锁定 information→pad→mask0 与 response content 段=当前 turn 值语义。
 
 ### 测试状态
 
-42 项全部通过：`data_build` 11（T01）+ `reward_format` 14（T04）+ `evidence` 8（T05）+ `core_algos` 9（T07）。
+91 项全部通过：`data_build` 14（T01 + FlashRAG split 锁定）+ `reward_format` 14（T04）+ `evidence` 13（T05 + Recall@K）+ `core_algos` 9（T07）+ `retrieval_client` 16（T03 客户端）+ `loss_mask` 10（T06 chain + tree）+ `adv_routing` 4（T07 路由）+ `tree_evidence_wiring` 6（Day 6 预备）+ `export_ckpt` 5（T09 脚本）。
 
 ### 门禁对照
 
 | 门禁 | 状态 | 说明 |
 |---|---|---|
-| T01 分组/索引 | ✅ | build.py 全局唯一 index，data_build 覆盖 |
+| T01 分组/索引 | ✅ | build.py 全局唯一 index + dev split 锁定（不消费 test），data_build 覆盖 |
 | T02 证据映射 | ⛔ | 依赖真实 FlashRAG 语料/索引 |
+| T03 检索契约 | 🟡 | 客户端超时/重试/错误分类已完成（16 项）；服务端批量顺序、doc_id 仍需真实索引 |
 | T04 分段奖励 | ✅ | 14 项测试锁定语义 |
-| T05 证据奖励 | ✅ | evidence.py + 8 项测试 |
-| T06 loss mask | 🟡 | 静态分析完成，运行时断言待真实 rollout |
-| T07 优势计算 | ✅ | 9 项测试锁定 |
+| T05 证据奖励 | ✅ | evidence.py + 13 项测试（R_evidence 8 + Recall@K 5）+ doc_id 提取纯函数 + 接线预备测试 |
+| T06 loss mask | 🟡 | 静态分析 + 单元测试完成（10 项：chain 6 + tree 4），运行时断言待真实 rollout |
+| T07 优势计算 | ✅ | 9 项 core_algos + 4 项路由测试锁定 |
+| T08 权重更新 | ⛔ | 需真实 GPU rollout 与 optimizer step |
+| T09 checkpoint | 🟡 | 导出脚本已参数化（5 项）；真实合并/加载/下一阶段更新待真实 checkpoint |
+| T10 预算 | ⛔ | 需真实 rollout 统计缓存/重试/逻辑调用 |
 
 ### 剩余阻塞项
 
 - [ ] 目标 Linux GPU 主机安装并核验两个 conda 环境（RL / Retriever），完成 Ray runtime_env、tokenizer 生成 + 一次 optimizer step。
 - [ ] 真实 FlashRAG 语料/索引就绪后：生成 128/64 条 smoke parquet + manifest，补齐 `doc_id` 与证据映射报告。
 - [ ] 检索服务就绪后：执行 `/retrieve` 契约测试。
-- [ ] 证据奖励接入树内回调（Day 6）：`sample_id` / `supporting_doc_ids` / `evidence_status` 随生成 batch 传入树采样，按 `final_node_list` 叶子顺序挂到奖励输入。
+- [ ] 证据奖励接入树内回调（Day 6）：接线蓝图与预备测试已交付（`docs/researchsearch/evidence-wiring.md` + `test_tree_evidence_wiring.py`），核心路径改动（pop 增字段 → 逐叶 `visible_doc_ids` → RewardManager 证据项）待真实 rollout 验证。
 - [ ] loss mask 运行时断言（真实 rollout）。

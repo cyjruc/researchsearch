@@ -8,10 +8,11 @@ from .tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
-import requests
 import uuid
 import random
 import numpy as np
+
+from search_r1.search.retrieval_client import post_retrieve
 
 from .tree_node import TreeNode, DEBUG, dprint
 
@@ -848,7 +849,8 @@ If I want to give the final answer, I should put the answer between <answer> and
             "return_scores": True
         }
         
-        return requests.post(self.config.search_url, json=payload).json()
+        # 统一超时、重试与错误分类（方案 §4.3），失败抛 RetrievalError。
+        return post_retrieve(self.config.search_url, payload)
 
     def _passages2string(self, retrieval_result):
         format_reference = ''
