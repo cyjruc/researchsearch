@@ -1,6 +1,6 @@
 # ResearchSearch-RL 环境与进度记录
 
-更新时间：2026-10-20（Asia/Shanghai）
+更新时间：2026-10-22（Asia/Shanghai）
 
 ## 本地开发机
 
@@ -8,10 +8,10 @@
 |---|---|---|
 | 系统 | macOS 15.7.3，Darwin 24.6.0 | 本机代码与文档环境 |
 | 芯片 | Apple M4，10 核 | 不是 CUDA 训练设备 |
-| 内存 | 16 GB | 训练集群资源尚未提供 |
+| 内存 | 16 GB | 本机内存（非训练机）；GPU 训练在 AutoDL A800 主机，见下 |
 | Python | 3.14.0，/opt/homebrew/bin/python3 | 与仓库 RL 环境建议版本不一致 |
 | 磁盘 | 挂载卷 460 GiB，剩余约 124 GiB | 本机 df 观测值 |
-| 工具 | conda、uv、git 可执行；nvidia-smi、nvcc、Ray CLI 不可用 | 仓库目录当前没有 .git 元数据 |
+| 工具 | conda、uv、git 可执行；nvidia-smi、nvcc、Ray CLI 不可用 | 仓库已 git 化：root /Users/ct/code/算法/researchsearch，remote git@github.com:cyjruc/researchsearch.git，HEAD 744dda7 |
 | Python 包 | 当前 Python 未发现 PyTorch、Ray、vLLM、Transformers、Datasets | 不代表目标 GPU 主机状态 |
 | CUDA GPU | 不可用 | 无法在本机完成 CUDA 模型生成、优化器更新或 Ray GPU smoke |
 
@@ -39,9 +39,70 @@
 
 仓库 README 是版本选择来源，不是本机安装记录。当前 Mac 环境不安装这套 CUDA 专用栈；应在兼容的 Linux GPU 训练机和检索机创建并验证。
 
+## 目标 GPU 主机实测（AutoDL）
+
+目标机为 AutoDL 按需 GPU 主机，`ssh -p 11824 root@connect.nma1.seetacloud.com`。以下均为真实观测值（2026-10-22）。
+
+### 硬件
+
+| 项目 | 已观测值 |
+|---|---|
+| GPU | NVIDIA A800 80GB PCIe（81920 MiB），driver 590.48.01 |
+| CPU | 112 核 |
+| 内存 | 991 GiB |
+| 磁盘 | 系统盘 30G（剩约 13G）；数据盘 /root/autodl-tmp 80G（剩约 75G） |
+
+模型、代码、日志统一放数据盘 `/root/autodl-tmp`，不占用 30G 系统盘。
+
+### RL 环境（treegrpo，实测）
+
+| 包 | 实测版本 |
+|---|---|
+| Python | 3.12.9 |
+| torch | 2.6.0（CUDA 12.4，`torch.cuda.is_available()`=True） |
+| vllm | 0.8.5.post1 |
+| flash-attn | 2.7.4.post1 |
+| ray | 2.59.0 |
+| swanlab | 0.10.2 |
+| transformers | 5.20.1 |
+| datasets | 5.1.0 |
+| verl | 0.1（editable，指向 /root/autodl-tmp/researchsearch/Tree-GRPO-main @ 744dda7） |
+
+### Retriever 环境（retriever，实测）
+
+| 包 | 实测版本 |
+|---|---|
+| Python | 3.10.13 |
+| torch | 2.6.0 |
+| transformers | 5.20.1 |
+| datasets | 5.1.0 |
+| pyserini | 1.2.0 |
+| fastapi | 0.149.0 |
+| uvicorn | 0.54.0 |
+| numpy | 1.26.4 |
+| faiss-gpu | ❌ 1.7.3 安装失败（该版本不存在于 PyPI） |
+
+两个环境的 `pip freeze` 已记录到远程 `/root/autodl-tmp/researchsearch/env-lock/{treegrpo_freeze.txt,retriever_freeze.txt}`。
+
+### 三段 smoke（真实 GPU，Qwen2.5-3B）
+
+模型 `Qwen2.5-3B`（5.8G）已下载到 `/root/autodl-tmp/models/Qwen2.5-3B`。在真实 GPU 上逐段验证：
+
+1. **tokenizer**：加载与 roundtrip 通过。
+2. **短生成**：通过，示例输出 "J.K. Rowling is the author of Harry Potter."
+3. **一次 AdamW optimizer step**：通过，loss 2.3828，参数张量已更新。
+
+对应 Day 1 任务 6 的「在目标 GPU 上完成 tokenizer、生成和一次 optimizer step」已真实通过。
+
+### 三个发现
+
+1. **faiss-gpu 1.7.3 是版本笔误**：PyPI 只有 1.7.1.post3 / 1.7.2 / 1.14.3 / 1.15.x，无 1.7.3。属计划/README 笔误，retriever 阶段需改用可用版本；不阻塞当前 RL。
+2. **huggingface_hub 2.2.0 的 Xet 存储后端匿名下载 401**：Qwen2.5-3B 走 Xet 存储，默认后端匿名访问被拒。修复：下载前 `export HF_HUB_DISABLE_XET=1`。
+3. **代码同步已确认一致**：verl 可编辑安装指向 `/root/autodl-tmp/researchsearch/Tree-GRPO-main`，该目录即 git clone（remote https://github.com/cyjruc/researchsearch.git，HEAD 744dda7 init2），与本机及 GitHub 完全一致；site-packages 中 `compute_recall_at_k`、`_DEV_FLASHRAG_SPLIT` 均已存在，无需额外 push 或重装。
+
 ## 源码基线
 
-本地 Tree-GRPO-main 没有 Git 元数据，不能报告上游 commit。以下 SHA-256 记录关键文件开发前的基线；正式启用 Git 后以提交记录追踪代码改动。
+仓库已 git 化：root `/Users/ct/code/算法/researchsearch`，remote `git@github.com:cyjruc/researchsearch.git`，HEAD `744dda7`（init2）。代码改动以提交记录追踪。下表 SHA-256 是早期（目录尚无 .git 时）关键文件的开发前基线，仅作历史留档，不代表当前内容。
 
 | 文件 | SHA-256 |
 |---|---|
@@ -97,12 +158,12 @@ Web 搜索服务使用单独的 retriever 环境。先启动 Redis，设置 BRIG
 - [x] 检查源码目录无 Git 元数据，记录关键文件哈希。
 - [x] 新增参数化 preflight 和 GRPO/Tree smoke 启动器。
 - [x] 新增从环境变量读取搜索服务凭据的启动器；改造原 Bing 启动入口以委托新脚本。
-- [ ] 在目标 Linux GPU 主机安装并锁定两个环境。
+- [x] 在目标 Linux GPU 主机安装并锁定两个环境。
 - [ ] 核验 Ray runtime_env 在 worker 上分发代码及模型、数据路径。
-- [ ] 在目标 GPU 上完成 tokenizer、生成和一次 optimizer step。
+- [x] 在目标 GPU 上完成 tokenizer、生成和一次 optimizer step。
 - [ ] 配置检索/Web 服务后发起并记录一次真实搜索请求。
 
-目标 GPU 主机、模型与数据挂载路径、Ray 地址及搜索服务凭据当前尚未提供，因此后四项保持待执行。
+目标 GPU 主机（AutoDL A800）已就位，两个 conda 环境已安装、三段 smoke（tokenizer / 生成 / optimizer step）已在真实 GPU 通过。仍待执行的是 Ray runtime_env 探针核验与检索服务配置后的真实搜索请求。
 
 ## Day 2 状态（数据层，不依赖 GPU / 检索服务）
 
@@ -154,7 +215,8 @@ Web 搜索服务使用单独的 retriever 环境。先启动 Redis，设置 BRIG
 
 ### 剩余阻塞项
 
-- [ ] 目标 Linux GPU 主机安装并核验两个 conda 环境（RL / Retriever），完成 Ray runtime_env、tokenizer 生成 + 一次 optimizer step。
+- [ ] 核验 Ray runtime_env 在 worker 上分发代码及模型、数据路径（GPU 已就位，两环境已装，三段 smoke 已通过；Ray 探针尚未提交）。
+- [ ] 补装 retriever 环境 faiss-gpu（1.7.3 为版本笔误，改用 PyPI 可用版本 1.7.2 / 1.14.3 等），随后配置检索/Web 服务并记录一次真实搜索请求。
 - [ ] 真实 FlashRAG 语料/索引就绪后：生成 128/64 条 smoke parquet + manifest，补齐 `doc_id` 与证据映射报告。
 - [ ] 检索服务就绪后：执行 `/retrieve` 契约测试。
 - [ ] 证据奖励接入树内回调（Day 6）：接线蓝图与预备测试已交付（`docs/researchsearch/evidence-wiring.md` + `test_tree_evidence_wiring.py`），核心路径改动（pop 增字段 → 逐叶 `visible_doc_ids` → RewardManager 证据项）待真实 rollout 验证。
