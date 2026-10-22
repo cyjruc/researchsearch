@@ -77,13 +77,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
             self.inference_engine.wake_up()
-            # TODO(ZSL): deal with 'hf' format
-            if load_format == 'dtensor':
-                from verl.third_party.vllm import load_dtensor_weights
-                load_dtensor_weights(
-                    params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
-            else:
-                raise NotImplementedError(f'load_format {load_format} not implemented')
+            # load_dtensor_weights 对 DTensor 走 redistribute；对单 GPU（NO_SHARD）
+            # 的完整普通 tensor（hf 格式）直接透传，见 redistribute_dtensor。
+            from verl.third_party.vllm import load_dtensor_weights
+            load_dtensor_weights(
+                params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
 
         del params

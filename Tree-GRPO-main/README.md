@@ -61,6 +61,8 @@ conda create -n treegrpo python=3.12.9
 conda activate treegrpo
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0  
 pip install vllm==0.8.5.post1
+# vllm 0.8.5 只兼容 transformers 4.x；datasets 5.x 要求 huggingface-hub>=1.31，需 pin 到兼容版本
+pip install transformers==4.51.3 datasets==3.5.0
 # verl
 pip install -e .
 # flash attention 2

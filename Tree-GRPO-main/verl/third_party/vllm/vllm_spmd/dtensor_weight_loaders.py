@@ -310,6 +310,10 @@ def gpt2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn
 
 
 def redistribute_dtensor(param_name: str, loaded_weights: DTensor, parallelize_plan: Dict = None):
+    # 单 GPU（FSDP NO_SHARD）下 state_dict 返回完整普通 tensor（hf 格式），
+    # 已是完整权重，直接返回，无需 DTensor redistribute。
+    if not isinstance(loaded_weights, DTensor):
+        return loaded_weights
     param_name = _process_parameter_names(name=param_name)
     if parallelize_plan is not None:
         assert (

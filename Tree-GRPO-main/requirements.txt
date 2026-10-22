@@ -1,6 +1,6 @@
 accelerate
 codetiming
-datasets
+datasets==3.5.0
 dill
 flash-attn
 hydra-core
@@ -8,6 +8,6 @@ numpy
 pandas
 pybind11
 tensordict
-transformers
+transformers==4.51.3
 IPython
 matplotlib
