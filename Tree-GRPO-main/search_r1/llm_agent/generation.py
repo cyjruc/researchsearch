@@ -48,11 +48,11 @@ class LLMGenerationManager:
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
         return self.tokenizer(
-            responses, 
-            add_special_tokens=False, 
-            return_tensors='pt', 
+            responses,
+            add_special_tokens=False,
+            return_tensors='pt',
             padding="longest"
-        )['input_ids']
+        )['input_ids'].long()
 
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
         """Process responses to stop at search operation or answer operation."""
@@ -81,11 +81,11 @@ class LLMGenerationManager:
         """Process next observations from environment."""
         
         next_obs_ids = self.tokenizer(
-            next_obs, 
+            next_obs,
             padding='longest',
             return_tensors='pt',
             add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
+        )['input_ids'].long()
 
         if next_obs_ids.shape[1] > self.config.max_obs_length:
             print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
@@ -181,6 +181,10 @@ class LLMGenerationManager:
         """
         num_gpus = self.config.num_gpus
         if num_gpus <= 1:
+            # 单卡路径与多卡路径对齐：token ids 强制转 int64，避免空 response 经 tokenizer
+            # 返回 float32 空张量后污染 input_ids，最终导致 vllm 拒绝 float token ids。
+            for key in active_batch.batch.keys():
+                active_batch.batch[key] = active_batch.batch[key].long()
             return self.actor_rollout_wg.generate_sequences(active_batch)
             
         batch_size = active_batch.batch['input_ids'].shape[0]
