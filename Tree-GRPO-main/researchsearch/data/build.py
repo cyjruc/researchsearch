@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 from pathlib import Path
@@ -178,6 +179,7 @@ def build_dataset(
     start_index: int = 0,
     environment: str = DEFAULT_ENVIRONMENT,
     corpus_version: Optional[str] = None,
+    seed: Optional[int] = None,
 ) -> dict:
     """合并 train/dev，去重、分配全局唯一 index，构造 sample 与 manifest。
 
@@ -188,6 +190,7 @@ def build_dataset(
             ``evidence_status``、``source_revision``。
         start_index: 全局 index 起始值（train 从它开始，dev 紧接其后）。
         environment / corpus_version: 写入 extra_info 的语料级元数据。
+        seed: 数据抽样种子，写入 manifest（方案 §4.1「逐条可追溯数据抽样种子」）。
 
     返回 dict：``train_samples``、``dev_samples``、``manifest``、``removed``。
     """
@@ -256,6 +259,7 @@ def build_dataset(
         "environment": environment,
         "corpus_version": corpus_version,
         "start_index": start_index,
+        "seed": seed,
         "train": {"count": len(train_samples), "index_range": [start_index, start_index + len(train_samples)]},
         "dev": {
             "count": len(dev_samples),
@@ -326,42 +330,59 @@ def load_flashrag_source(
     source_revision: Optional[str] = None,
     evidence_map_fn=None,
 ) -> list[dict]:
-    """从 FlashRAG 目录读取一个数据源（仅目标机，依赖 datasets 库与语料）。
+    """从 FlashRAG 目录读取一个数据源（JSONL 直存格式）。
+
+    FlashRAG 数据集（RUC-NLPIR/FlashRAG_datasets）以 JSONL 存储：每个
+    ``data_source`` 一个子目录，含 ``train.jsonl`` / ``dev.jsonl``（部分源还有
+    ``test.jsonl``）。``split`` 对应的 JSONL 必须存在，否则抛出 ``ValueError``
+    ——不自动回退到其他 split，避免正式生成数据时 train/dev 隔离失效。
 
     ``evidence_map_fn(example, idx)`` 返回 ``{"supporting_doc_ids": [...],
     "evidence_status": "..."}``，用于把各数据集的结构化支持事实映射到统一
     doc_id。未提供时证据字段留空（evidence_status=not_available）。
     """
-    import datasets  # 延迟导入，避免本机无依赖时不可用
-
-    dataset = datasets.load_dataset(dataset_dir, data_source)
-    if split in dataset:
-        subset = dataset[split]
-    elif "dev" in dataset:
-        subset = dataset["dev"]
-    else:
-        subset = dataset["train"]
+    path = Path(dataset_dir) / data_source / f"{split}.jsonl"
+    if not path.exists():
+        raise ValueError(
+            f"data_source={data_source!r} 没有 split={split!r} 的 JSONL（{path} 不存在）。"
+            "为保持 train/dev 隔离，不自动回退到其他 split。"
+        )
 
     records: list[dict] = []
-    for idx, example in enumerate(subset):
-        evidence = evidence_map_fn(example, idx) if evidence_map_fn else {}
-        records.append(
-            {
-                "data_source": data_source,
-                "source_id": str(example.get("id", idx)),
-                "source_index": idx,
-                "question": example["question"],
-                "golden_answers": example["golden_answers"],
-                "supporting_doc_ids": evidence.get("supporting_doc_ids"),
-                "evidence_status": evidence.get("evidence_status"),
-                "source_revision": source_revision,
-            }
-        )
+    with open(path, "r", encoding="utf-8") as fh:
+        for idx, line in enumerate(fh):
+            line = line.strip()
+            if not line:
+                continue
+            example = json.loads(line)
+            evidence = evidence_map_fn(example, idx) if evidence_map_fn else {}
+            records.append(
+                {
+                    "data_source": data_source,
+                    "source_id": str(example.get("id", idx)),
+                    "source_index": idx,
+                    "question": example["question"],
+                    "golden_answers": example["golden_answers"],
+                    "supporting_doc_ids": evidence.get("supporting_doc_ids"),
+                    "evidence_status": evidence.get("evidence_status"),
+                    "source_revision": source_revision,
+                }
+            )
     return records
 
 
 def _split_sources(spec: Optional[str]) -> list[str]:
     return [s for s in (spec or "").split(",") if s]
+
+
+def _sample_records(records: list[dict], n: Optional[int], *, seed: int) -> list[dict]:
+    """按 ``seed`` 确定性抽样 ``n`` 条；不足 ``n`` 全取。抽后按 ``source_index``
+    恢复原始顺序，保证 manifest 顺序稳定、可复现（方案 §3.1 抽样种子）。"""
+    if n is None or n >= len(records):
+        return records
+    rng = random.Random(seed)
+    sampled = rng.sample(records, n)
+    return sorted(sampled, key=lambda r: r["source_index"])
 
 
 def _write_split(out_dir: Path, samples: list[dict], split: str) -> None:
@@ -383,8 +404,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--start-index", type=int, default=0, help="全局 index 起始值")
     parser.add_argument("--environment", default=DEFAULT_ENVIRONMENT)
     parser.add_argument("--corpus-version", default=None)
+    parser.add_argument("--seed", type=int, default=None, help="数据抽样种子（写入 manifest，可追溯）")
+    parser.add_argument("--train-sample", default=None, help="逗号分隔每源抽样数（与 --train-flashrag 顺序对应，需 --seed）")
+    parser.add_argument("--dev-sample", default=None, help="逗号分隔每源抽样数（与 --dev-flashrag 顺序对应，需 --seed）")
+    parser.add_argument("--title-docid-map", default=None, help="title→doc_id 映射表 JSON（{title: [doc_id]}，注入 evidence_map_fn）")
     parser.add_argument("--source-revision", default=None, help="统一来源版本（所有来源共用）")
     args = parser.parse_args(argv)
+
+    title_map: dict = {}
+    if args.title_docid_map:
+        with open(args.title_docid_map, "r", encoding="utf-8") as fh:
+            title_map = json.load(fh)
+
+    train_sample = [int(x) for x in _split_sources(args.train_sample)] if args.train_sample else []
+    dev_sample = [int(x) for x in _split_sources(args.dev_sample)] if args.dev_sample else []
+    if (train_sample or dev_sample) and args.seed is None:
+        parser.error("抽样（--train-sample / --dev-sample）必须配合 --seed 以保持可复现")
 
     train_records: list[dict] = []
     dev_records: list[dict] = []
@@ -397,14 +432,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.train_flashrag or args.dev_flashrag:
         if not args.flashrag_dir:
             parser.error("--flashrag-dir 必须与 --train-flashrag / --dev-flashrag 一起提供")
-        for data_source in _split_sources(args.train_flashrag):
-            train_records.extend(
-                load_flashrag_source(args.flashrag_dir, data_source, _TRAIN_FLASHRAG_SPLIT, source_revision=args.source_revision)
+        from researchsearch.data import evidence_map  # 延迟导入，保持核心逻辑零重依赖
+
+        def _evidence_fn(data_source):
+            if not title_map:
+                return None
+            return evidence_map.make_evidence_map_fn(title_map, data_source=data_source)
+
+        for i, data_source in enumerate(_split_sources(args.train_flashrag)):
+            recs = load_flashrag_source(
+                args.flashrag_dir, data_source, _TRAIN_FLASHRAG_SPLIT,
+                source_revision=args.source_revision,
+                evidence_map_fn=_evidence_fn(data_source),
             )
-        for data_source in _split_sources(args.dev_flashrag):
-            dev_records.extend(
-                load_flashrag_source(args.flashrag_dir, data_source, _DEV_FLASHRAG_SPLIT, source_revision=args.source_revision)
+            n = train_sample[i] if i < len(train_sample) else None
+            train_records.extend(_sample_records(recs, n, seed=args.seed))
+        for i, data_source in enumerate(_split_sources(args.dev_flashrag)):
+            recs = load_flashrag_source(
+                args.flashrag_dir, data_source, _DEV_FLASHRAG_SPLIT,
+                source_revision=args.source_revision,
+                evidence_map_fn=_evidence_fn(data_source),
             )
+            n = dev_sample[i] if i < len(dev_sample) else None
+            dev_records.extend(_sample_records(recs, n, seed=args.seed))
 
     if not train_records and not dev_records:
         parser.error("至少提供一个数据源（--train-jsonl / --dev-jsonl / --train-flashrag / --dev-flashrag）")
@@ -415,6 +465,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         start_index=args.start_index,
         environment=args.environment,
         corpus_version=args.corpus_version,
+        seed=args.seed,
     )
 
     out_dir = Path(args.out_dir)

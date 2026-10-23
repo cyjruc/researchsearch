@@ -68,7 +68,12 @@ except ImportError:
 
 from tqdm import tqdm
 
-from verl.utils import hf_processor, hf_tokenizer
+from verl.utils import hf_tokenizer
+
+try:
+    from verl.utils import hf_processor
+except ImportError:  # verl 0.8.x 无 hf_processor（多模态 processor，纯文本模型不需要）
+    hf_processor = None
 
 
 @dataclass
@@ -141,7 +146,7 @@ class BaseModelMerger(ABC):
         del state_dict
         del model
 
-        processor = hf_processor(self.hf_model_config_path)
+        processor = hf_processor(self.hf_model_config_path) if hf_processor is not None else None
         tokenizer = hf_tokenizer(self.hf_model_config_path)
         if processor is not None:
             print(f"Saving processor to {self.config.target_dir}")
@@ -595,6 +600,19 @@ class MegatronModelMerger(BaseModelMerger):
         return None  # Return None if no mapping found
 
 
+def _resolve_hf_config_path(local_dir: str) -> str:
+    """Locate the HF config/tokenizer directory for a verl checkpoint.
+
+    verl 0.8.x saves HF config/tokenizer into ``{local_dir}/huggingface/``, so
+    prefer that subdirectory when it contains a ``config.json``; otherwise fall
+    back to ``local_dir`` (newer verl / plain HF layout).
+    """
+    hf_dir = os.path.join(local_dir, "huggingface")
+    if os.path.isfile(os.path.join(hf_dir, "config.json")):
+        return hf_dir
+    return local_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="verl model merger")
     subparsers = parser.add_subparsers(dest="operation", required=True, help="Specify 'merge' or 'test' operation.")
@@ -623,7 +641,7 @@ def main():
         "is_value_model": args.is_value_model,
         "local_dir": args.local_dir,
         "hf_model_path": args.hf_model_path,
-        "hf_model_config_path": args.local_dir,
+        "hf_model_config_path": _resolve_hf_config_path(args.local_dir),
     }
 
     if args.operation == "merge":

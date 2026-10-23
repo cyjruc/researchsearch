@@ -50,16 +50,42 @@ def _dedup_preserve_order(ids: Iterable[Optional[str]]) -> list[str]:
     return out
 
 
+def _doc_title(doc: dict) -> Optional[str]:
+    """从 document 提取 title（``title`` 字段优先，回退 ``contents`` 首行去引号）。
+
+    真实 Wiki 检索器两种返回结构（见 docs/researchsearch/retrieval-contract.md §2）：
+    - BM25：``{"title": "已去引号", "text": ..., "contents": ...}``。
+    - Dense/FAISS：``{"id": <整数行号>, "contents": "\"Title\"\\n正文"}``（无 title 字段）。
+    title 级 doc_id 需要统一取 title，本函数覆盖两种结构。
+    """
+    title = doc.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    contents = doc.get("contents")
+    if isinstance(contents, str):
+        first = contents.split("\n", 1)[0].strip()
+        if len(first) >= 2 and first[0] == '"' and first[-1] == '"':
+            first = first[1:-1]
+        if first:
+            return first
+    return None
+
+
 def extract_doc_ids_from_retrieval(result) -> list[str]:
-    """从 Wiki 检索原始返回中提取稳定 ``document.id``，按返回顺序保序。
+    """从 Wiki 检索原始返回中提取 title 级 doc_id（``wiki:<title>``），按返回顺序保序。
 
-    Wiki 后端返回形状（见 docs/researchsearch/retrieval-contract.md §4.3）：
+    title 级文档粒度（架构 §2.1 / 第 2 周 §3.2 决策）：一篇维基文章是一个文档，
+    doc_id = ``wiki:<title>``。真实检索器不返回稳定的字符串 ``document.id``
+    （Dense 返回的 ``id`` 是整数行号，属于段落级 chunk，不能作为文档级 doc_id），
+    因此统一从 ``document.title``（BM25 已去引号）或 ``document.contents`` 首行
+    （Dense）构造 title 级 doc_id。仅当上游显式给出 ``wiki:`` 前缀的字符串
+    ``document.id``（真正的稳定文档级 id）时才优先使用；段落级行号即使以字符串
+    存储（真实 wiki-18 的 ``{"id": "0", ...}``）也不会被误当 doc_id，而是回退
+    从 title 构造。
 
-        [{"document": {"id": "wiki:123", "contents": "标题\\n正文"}, "score": 0.8}, ...]
-
-    Agent 观察由 ``_passages2string`` 拼成 ``Doc N(Title: ...) ...``，``document.id``
-    在该处被丢弃。树内证据接线需要旁路保留每个搜索实际返回的文档 ID，因此本函数
-    直接从原始 ``result`` 取 ``document.id``，供 :func:`compute_evidence_reward`
+    Agent 观察由 ``_passages2string`` 拼成 ``Doc N(Title: ...) ...``，``document``
+    里的 id 在该处被丢弃。树内证据接线需要旁路保留每个搜索实际返回的文档 ID，
+    因此本函数直接从原始 ``result`` 提取 doc_id，供 :func:`compute_evidence_reward`
     的 ``visible_doc_ids`` / ``retrieval_hit_doc_ids`` 与 Recall@K 复用。
 
     Args:
@@ -78,8 +104,12 @@ def extract_doc_ids_from_retrieval(result) -> list[str]:
         if not isinstance(doc, dict):
             continue
         doc_id = doc.get("id")
-        if isinstance(doc_id, str) and doc_id.strip():
+        if isinstance(doc_id, str) and doc_id.strip().startswith("wiki:"):
             ids.append(doc_id.strip())
+            continue
+        title = _doc_title(doc)
+        if title:
+            ids.append(f"wiki:{title}")
     return ids
 
 
@@ -145,6 +175,19 @@ def compute_evidence_reward(
     }
 
 
+def combine_score_with_evidence(base_score: float, evidence_result: dict, alpha: float) -> float:
+    """按 R_total = R_existing + alpha * R_evidence 合并基础奖励与证据覆盖率。
+
+    ``alpha=0`` 时证据项完全关闭，直接返回 ``base_score``；``evidence_result``
+    的 ``eligible=False`` 时其 ``score`` 为 0，合并结果等于 ``base_score``。
+    本函数不判定答案对错，只做加权求和——是否只在答案正确时叠加由调用方决定。
+    独立成纯函数是为了无 GPU 锁定「alpha 开关 / 非 eligible 零贡献」两条语义。
+    """
+    if alpha == 0.0:
+        return float(base_score)
+    return float(base_score) + float(alpha) * float(evidence_result.get("score", 0.0))
+
+
 def compute_recall_at_k(
     gold_doc_ids: Iterable[str],
     retrieved_doc_ids: Iterable[str],
@@ -188,3 +231,62 @@ def compute_recall_at_k(
         "num_hit": len(hit),
         "truncated_doc_ids": truncated,
     }
+
+
+def split_doc_ids_by_truncation(
+    doc_ids: Iterable[str],
+    doc_token_lengths: Iterable[int],
+    *,
+    prefix_token_length: int = 0,
+    max_obs_length: int,
+) -> dict:
+    """按「截断后仍完整保留」划分检索返回的文档 ID（方案 §4.2 最细部分）。
+
+    判定口径对齐 ``generation_ts._process_next_obs``：observation 整体 tokenize 后
+    只保留前 ``max_obs_length`` 个 token。文档 ``i`` 的 token 区间为
+    ``[prefix + Σ_{j<i} len_j, prefix + Σ_{j≤i} len_j)``；结束位置
+    ``<= max_obs_length`` 即完整保留（进入 Agent 观察），开始位置
+    ``< max_obs_length`` 但结束位置超出的文档被部分截断，同样视为未进入观察。
+    ``visible`` 与 ``retrieval_hit`` 互斥，并集为后端返回的全部文档，均保序、
+    不去重（去重由 :func:`compute_evidence_reward` 负责）。
+
+    「不能用后端返回了几个替代」正是本函数要防的：后端返回 topk 个文档，但被
+    ``max_obs_length`` 截断后，只有完整保留的那几个真正进入 Agent 观察，其余
+    只记 ``retrieval_hit``（架构 §2.1 的证据奖励与 Recall@K 分离口径）。
+
+    Args:
+        doc_ids: 检索返回的文档 ID，按检索顺序（可重复，不去重）。
+        doc_token_lengths: 与 ``doc_ids`` 等长，每个文档格式化后
+            （``Doc N(Title: ...) 正文\\n``）的 token 数。
+        prefix_token_length: observation 前缀（``\\n\\n<information>``）的 token 数，
+            作为第一个文档的起始偏移。
+        max_obs_length: ``_process_next_obs`` 的截断长度（token 数）。
+
+    Returns:
+        dict：``visible_doc_ids``（截断后仍完整保留、进入观察的 doc_id）与
+        ``retrieval_hit_doc_ids``（后端返回但被截断、未进入观察的 doc_id）。
+
+    近似说明：逐文档 token 数之和与整段 observation 一次 tokenize 可能有 BPE 跨
+    边界合并的 ±1~2 token 差异（每个文档以 ``\\n`` 结尾，天然是 token 边界）。
+    真实接入若需严格对齐 ``_process_next_obs`` 的整段 tokenize，可用 tokenizer
+    offsets 定位每个文档的结束位置，判定规则（结束位置 <= ``max_obs_length``）
+    不变。
+    """
+    ids = list(doc_ids)
+    lengths = [int(n) for n in doc_token_lengths]
+    if len(ids) != len(lengths):
+        raise ValueError(
+            f"doc_ids 与 doc_token_lengths 长度不一致：{len(ids)} != {len(lengths)}"
+        )
+
+    visible: list[str] = []
+    retrieval_hit: list[str] = []
+    end = prefix_token_length
+    for doc_id, length in zip(ids, lengths):
+        start = end
+        end = start + length
+        if end <= max_obs_length:
+            visible.append(doc_id)
+        else:
+            retrieval_hit.append(doc_id)
+    return {"visible_doc_ids": visible, "retrieval_hit_doc_ids": retrieval_hit}

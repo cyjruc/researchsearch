@@ -18,6 +18,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 from verl import DataProto
 import torch
 from verl.utils.reward_score import qa_em, qa_em_format, qa_f1_format
+from verl.utils.reward_score.evidence import compute_evidence_reward, combine_score_with_evidence
 from verl.trainer.ppo.ray_trainer_ts import RayPPOTrainer
 import re
 import numpy as np
@@ -33,13 +34,14 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, structure_format_score=0., final_format_score=0., retrieval_score=0., format_score=0.) -> None:
+    def __init__(self, tokenizer, num_examine, structure_format_score=0., final_format_score=0., retrieval_score=0., format_score=0., evidence_alpha=0.) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
         self.structure_format_score = structure_format_score
         self.final_format_score = final_format_score
         self.retrieval_score = retrieval_score
+        self.evidence_alpha = evidence_alpha
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -78,12 +80,30 @@ class RewardManager():
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
 
-            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, 
-                                     structure_format_score=self.structure_format_score, 
-                                     final_format_score=self.final_format_score, 
+            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth,
+                                     structure_format_score=self.structure_format_score,
+                                     final_format_score=self.final_format_score,
                                      retrieval_score=self.retrieval_score,
                                      format_score=self.format_score,
                                      data_source=data_source)
+
+            # 证据奖励（Day 6 任务 1）：R_total = R_existing + alpha * R_evidence。
+            # 根样本证据沿 repeat 进入 extra_info，叶子可见文档 ID 由 tree rollout 写入
+            # visible_doc_ids，两者行序对齐；缺失字段安全降级为证据项=0。
+            extra_info = data_item.non_tensor_batch.get('extra_info') or {}
+            if isinstance(extra_info, dict):
+                gold_doc_ids = extra_info.get('supporting_doc_ids', [])
+                evidence_status = extra_info.get('evidence_status', 'mapped')
+            else:
+                gold_doc_ids = []
+                evidence_status = 'mapped'
+            visible_doc_ids = data_item.non_tensor_batch.get('visible_doc_ids', [])
+            evidence_res = compute_evidence_reward(
+                gold_doc_ids=gold_doc_ids,
+                visible_doc_ids=visible_doc_ids,
+                evidence_status=evidence_status,
+            )
+            score = combine_score_with_evidence(score, evidence_res, self.evidence_alpha)
 
             reward_tensor[i, valid_response_length - 1] = score
             all_scores.append(score)
@@ -182,10 +202,11 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, 
-                              structure_format_score=config.reward_model.structure_format_score, 
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0,
+                              structure_format_score=config.reward_model.structure_format_score,
                               final_format_score=config.reward_model.final_format_score,
-                              retrieval_score=config.reward_model.retrieval_score)
+                              retrieval_score=config.reward_model.retrieval_score,
+                              evidence_alpha=config.reward_model.get('evidence_alpha', 0.0))
 
     # Note that we always use function-based RM for validation
     val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)

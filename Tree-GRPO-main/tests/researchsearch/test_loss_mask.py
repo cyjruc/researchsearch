@@ -61,6 +61,9 @@ def _load_generation():
         ("verl", {"DataProto": type("DataProto", (), {})}),
         ("verl.utils", {}),
         ("verl.utils.tracking", {"Tracking": type("Tracking", (), {})}),
+        # evidence 纯标准库模块按真实路径加载，供 generation_ts 顶层
+        # `from verl.utils.reward_score.evidence import ...` 解析。
+        ("verl.utils.reward_score", {}),
         ("search_r1", {}),
         ("search_r1.llm_agent", {}),
         ("search_r1.search", {}),
@@ -68,10 +71,13 @@ def _load_generation():
             "post_retrieve": lambda *a, **k: {},
             "RetrievalError": type("RetrievalError", (Exception,), {}),
         }),
+        # generation_ts 顶层 import 了 cost_stats；本文件只测 mask 拼接，mock 掉即可。
+        ("search_r1.search.cost_stats", {"physical_new_tokens_from_tree": lambda *a, **k: 0}),
         ("search_r1.llm_agent.tree_node", {
             "TreeNode": type("TreeNode", (), {}),
             "dprint": lambda *a, **k: None,
             "DEBUG": False,
+            "export_tree_roots": lambda *a, **k: [],
         }),
     ):
         mod = sys.modules.get(name)
@@ -82,6 +88,14 @@ def _load_generation():
         # 也要补齐本文件需要的属性（如 verl.DataProto）。
         for key, value in attrs.items():
             setattr(mod, key, value)
+
+    # 加载真实 evidence.py（纯标准库，无重型依赖），供 generation_ts 顶层 import。
+    ev_spec = importlib.util.spec_from_file_location(
+        "verl.utils.reward_score.evidence", _REPO / "verl/utils/reward_score/evidence.py"
+    )
+    ev_mod = importlib.util.module_from_spec(ev_spec)
+    sys.modules["verl.utils.reward_score.evidence"] = ev_mod
+    ev_spec.loader.exec_module(ev_mod)
 
     th_spec = importlib.util.spec_from_file_location(
         "search_r1.llm_agent.tensor_helper", _REPO / "search_r1/llm_agent/tensor_helper.py"

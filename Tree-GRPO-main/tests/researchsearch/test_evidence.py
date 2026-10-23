@@ -137,3 +137,139 @@ def test_recall_at_k_k_zero_or_negative_is_empty():
     assert r["num_retrieved"] == 0
     r2 = evidence.compute_recall_at_k(["wiki:a"], ["wiki:a"], k=-1)
     assert r2["num_retrieved"] == 0
+
+
+# --- 截断后可见判定（方案 §4.2 最细部分） -----------------------------------
+
+
+def test_split_by_truncation_all_visible():
+    # 三个文档 token 数 2+2+2，结束位置 6 == max_obs_length，全部完整保留。
+    r = evidence.split_doc_ids_by_truncation(
+        ["wiki:a", "wiki:b", "wiki:c"], [2, 2, 2], max_obs_length=6
+    )
+    assert r["visible_doc_ids"] == ["wiki:a", "wiki:b", "wiki:c"]
+    assert r["retrieval_hit_doc_ids"] == []
+
+
+def test_split_by_truncation_boundary_end_equal_max_is_visible():
+    # 结束位置 == max_obs_length 时文档仍完整保留（截断保留前 max 个 token，含末位）。
+    r = evidence.split_doc_ids_by_truncation(
+        ["wiki:a", "wiki:b"], [2, 2], max_obs_length=4
+    )
+    assert r["visible_doc_ids"] == ["wiki:a", "wiki:b"]
+    assert r["retrieval_hit_doc_ids"] == []
+
+
+def test_split_by_truncation_tail_fully_cut():
+    # 第三个文档起始位置 4 >= max_obs_length=4，完全被截掉 → retrieval_hit。
+    r = evidence.split_doc_ids_by_truncation(
+        ["wiki:a", "wiki:b", "wiki:c"], [2, 2, 2], max_obs_length=4
+    )
+    assert r["visible_doc_ids"] == ["wiki:a", "wiki:b"]
+    assert r["retrieval_hit_doc_ids"] == ["wiki:c"]
+
+
+def test_split_by_truncation_partially_cut_doc_is_hit():
+    # 文档开始 < max 但结束 > max：被部分截断，同样不算「完整保留」，只记 hit。
+    r = evidence.split_doc_ids_by_truncation(
+        ["wiki:a", "wiki:b"], [3, 3], max_obs_length=4
+    )
+    assert r["visible_doc_ids"] == ["wiki:a"]
+    assert r["retrieval_hit_doc_ids"] == ["wiki:b"]
+
+
+def test_split_by_truncation_prefix_offset_shifts_cut():
+    # 前缀（\n\n<information>）占用 token，使截断线相对文档提前。
+    # wiki:a 区间 [5,7) 结束 7 <= 7 可见；wiki:b [7,9) 不可见。
+    r = evidence.split_doc_ids_by_truncation(
+        ["wiki:a", "wiki:b"], [2, 2], prefix_token_length=5, max_obs_length=7
+    )
+    assert r["visible_doc_ids"] == ["wiki:a"]
+    assert r["retrieval_hit_doc_ids"] == ["wiki:b"]
+
+
+def test_split_by_truncation_max_smaller_than_prefix_all_hit():
+    # max_obs_length 连前缀都放不下时，所有文档都不可见。
+    r = evidence.split_doc_ids_by_truncation(
+        ["wiki:a"], [2], prefix_token_length=5, max_obs_length=3
+    )
+    assert r["visible_doc_ids"] == []
+    assert r["retrieval_hit_doc_ids"] == ["wiki:a"]
+
+
+def test_split_by_truncation_length_mismatch_raises():
+    with pytest.raises(ValueError):
+        evidence.split_doc_ids_by_truncation(
+            ["wiki:a", "wiki:b"], [2], max_obs_length=10
+        )
+
+
+def test_split_by_truncation_preserves_order_and_no_dedup():
+    # 保序、不去重：去重由 compute_evidence_reward 内部负责，本函数只做截断判定。
+    r = evidence.split_doc_ids_by_truncation(
+        ["wiki:a", "wiki:a", "wiki:b"], [2, 2, 2], max_obs_length=6
+    )
+    assert r["visible_doc_ids"] == ["wiki:a", "wiki:a", "wiki:b"]
+
+
+def test_split_by_truncation_feeds_evidence_reward():
+    # 端到端：截断后可见 → 证据奖励；被截断的 gold 只记 retrieval_hit，不进分子。
+    split = evidence.split_doc_ids_by_truncation(
+        ["wiki:a", "wiki:b", "wiki:c"], [2, 2, 2], max_obs_length=4
+    )
+    assert split["visible_doc_ids"] == ["wiki:a", "wiki:b"]
+    assert split["retrieval_hit_doc_ids"] == ["wiki:c"]
+
+    r = evidence.compute_evidence_reward(
+        ["wiki:a", "wiki:c"],
+        split["visible_doc_ids"],
+        retrieval_hit_doc_ids=split["retrieval_hit_doc_ids"],
+    )
+    # gold={a,c}；a 可见、c 被截断只记 hit → 覆盖率 0.5。
+    assert r["score"] == pytest.approx(0.5)
+    assert r["num_covered"] == 1
+    assert r["num_retrieval_hit"] == 1
+
+
+# --- title 级 doc_id 提取（第 2 周 §3.2 决策） ---------------------------------
+
+
+def test_extract_doc_ids_bm25_title_field():
+    # BM25 返回 title 字段（已去引号），构造 title 级 doc_id。
+    result = [
+        {"document": {"title": "Ed Wood", "text": "x", "contents": '"Ed Wood"\nx'}, "score": 0.8},
+    ]
+    assert evidence.extract_doc_ids_from_retrieval(result) == ["wiki:Ed Wood"]
+
+
+def test_extract_doc_ids_dense_from_contents_first_line():
+    # Dense/FAISS 返回整数行号 id + contents（title 在首行带引号）；整数 id 不能作为
+    # 文档级 doc_id，须从 contents 首行构造 title 级 doc_id。
+    result = [
+        {"document": {"id": 123, "contents": '"Shirley Temple"\nbody'}, "score": 0.7},
+    ]
+    assert evidence.extract_doc_ids_from_retrieval(result) == ["wiki:Shirley Temple"]
+
+
+def test_extract_doc_ids_prefers_string_id():
+    # 上游显式给出字符串 document.id 时优先使用（向后兼容 fixture / 未来稳定 id 补齐）。
+    result = [{"document": {"id": "wiki:Paris", "title": "Paris"}, "score": 0.9}]
+    assert evidence.extract_doc_ids_from_retrieval(result) == ["wiki:Paris"]
+
+
+def test_extract_doc_ids_skips_missing_and_invalid():
+    result = [
+        {"document": {"title": ""}, "score": 0.9},
+        {"score": 0.5},
+        "not-a-dict",
+    ]
+    assert evidence.extract_doc_ids_from_retrieval(result) == []
+
+
+def test_extract_doc_ids_dense_string_row_id_falls_back_to_title():
+    # 真实 wiki-18：dense 返回的 document.id 是段落级行号的**字符串**（如 "0"），
+    # 不能作为文档级 doc_id，须回退从 contents 首行构造 title 级 doc_id。
+    result = [
+        {"document": {"id": "0", "contents": '"Evan Morris"\nEvan L. Morris ...'}, "score": 0.7},
+    ]
+    assert evidence.extract_doc_ids_from_retrieval(result) == ["wiki:Evan Morris"]

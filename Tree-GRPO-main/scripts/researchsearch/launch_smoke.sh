@@ -17,11 +17,16 @@ esac
 DATA_DIR="${DATA_DIR:-}"
 MODEL_PATH="${MODEL_PATH:-}"
 LEARNING_RATE="${LEARNING_RATE:-}"
-N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-}"
+N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-2}"
 LOG_DIR="${LOG_DIR:-}"
 RAY_ADDRESS="${RAY_ADDRESS:-}"
 RETRIEVER_URL="${RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}"
 ALGORITHM="${ALGORITHM:-grpo}"
+# 证据奖励权重（T02/T05 验证：tree 算法时 alpha=0.1 使证据项生效；正式 E3 由消融定）
+EVIDENCE_ALPHA="${EVIDENCE_ALPHA:-0.1}"
+# 逐叶证据导出目录（T02/T05 验证：run_llm_loop_tree_search 读 EVIDENCE_EXPORT_DIR，
+# 由 RUNTIME_ENV 的 env_vars 注入到 Ray worker；为空则关闭导出，不影响训练）
+EVIDENCE_EXPORT_DIR="${EVIDENCE_EXPORT_DIR:-}"
 TRAIN_FILE="${TRAIN_FILE:-${DATA_DIR}/train.parquet}"
 DEV_FILE="${DEV_FILE:-${DATA_DIR}/dev.parquet}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-day1-${ALGORITHM}-smoke}"
@@ -40,6 +45,17 @@ TREE_L="${TREE_L:-1}"
 TREE_K="${TREE_K:-3}"
 MAX_TURNS="${MAX_TURNS:-3}"
 RETRIEVER_TOPK="${RETRIEVER_TOPK:-3}"
+# 单卡 smoke 内存策略：param/grad 留 GPU（避免单卡 NO_SHARD 下整模型 offload 到 CPU 导致 RAM OOM），
+# 仅 optimizer 的 fp32 AdamW 状态（约 24.7GB）offload 到 CPU，为 validate/后续 step 恢复 KV cache 留出 GPU 空间。
+# 0.3（约 16.5GB KV cache）配合 optimizer_offload=true，GPU 常驻约 24GB，安全。
+# 4-GPU 分片训练（launch_wiki.sh 正式口径）不受此限制，仍用 0.6 且 offload=true。
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.3}"
+# Ray 运行时环境文件路径；默认用仓库自带的 verl/trainer/runtime_env.yaml。
+# 端到端验证树结构导出时可指向一个额外注入 TREE_EXPORT_DIR 的临时 yaml。
+RUNTIME_ENV="${RUNTIME_ENV:-verl/trainer/runtime_env.yaml}"
+# E0 协议开关（Day 3）：val_only=true 时只跑验证、不进入优化器更新（配合 val_before_train=true）。
+VAL_ONLY="${VAL_ONLY:-false}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
 
 export DATA_DIR MODEL_PATH LEARNING_RATE N_GPUS_PER_NODE LOG_DIR RAY_ADDRESS RETRIEVER_URL TRAIN_FILE DEV_FILE
 
@@ -82,15 +98,15 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.actor.use_kl_loss=true"
     "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
     "actor_rollout_ref.actor.ppo_micro_batch_size=${PPO_MICRO_BATCH_SIZE}"
-    "actor_rollout_ref.actor.fsdp_config.param_offload=true"
-    "actor_rollout_ref.actor.fsdp_config.grad_offload=true"
+    "actor_rollout_ref.actor.fsdp_config.param_offload=false"
+    "actor_rollout_ref.actor.fsdp_config.grad_offload=false"
     "actor_rollout_ref.actor.fsdp_config.optimizer_offload=true"
     "actor_rollout_ref.rollout.log_prob_micro_batch_size=${PPO_MICRO_BATCH_SIZE}"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=1"
     "actor_rollout_ref.rollout.name=vllm"
-    "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
+    "actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
     "actor_rollout_ref.ref.log_prob_micro_batch_size=${PPO_MICRO_BATCH_SIZE}"
-    "actor_rollout_ref.ref.fsdp_config.param_offload=true"
+    "actor_rollout_ref.ref.fsdp_config.param_offload=false"
     "actor_rollout_ref.actor.kl_loss_coef=0.001"
     "actor_rollout_ref.actor.kl_loss_type=low_var_kl"
     "algorithm.no_think_rl=false"
@@ -98,8 +114,8 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.rollout.temperature=1"
     "actor_rollout_ref.actor.state_masking=true"
     "trainer.logger=['console']"
-    "+trainer.val_only=false"
-    "+trainer.val_before_train=false"
+    "+trainer.val_only=${VAL_ONLY}"
+    "+trainer.val_before_train=${VAL_BEFORE_TRAIN}"
     "trainer.default_hdfs_dir=null"
     "trainer.n_gpus_per_node=${N_GPUS_PER_NODE}"
     "trainer.nnodes=1"
@@ -135,13 +151,14 @@ else
         "actor_rollout_ref.rollout.reward_mode=base"
         "actor_rollout_ref.rollout.expand_mode=random"
         "actor_rollout_ref.rollout.n_agent=1"
+        "reward_model.evidence_alpha=${EVIDENCE_ALPHA}"
     )
 fi
 
 JOB_COMMAND=(
     ray job submit
     "--address=${RAY_ADDRESS}"
-    "--runtime-env=verl/trainer/runtime_env.yaml"
+    "--runtime-env=${RUNTIME_ENV}"
     --
     python3 -m "${MAIN_MODULE}"
     "${COMMON_OVERRIDES[@]}"

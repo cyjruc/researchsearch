@@ -111,7 +111,7 @@
 | train_multihopqa_grpo.sh | 2c048b6584e0a036854c47fd9edc7e1c0b4c613918f15c337cc2cf607c8f572 |
 | train_multihopqa_tree_search.sh | d1dd6b8dda6ffbe7c6c97c72132c56083ea3d2c3ccc213d3cdeb36789807cba0 |
 
-全仓库源码快照（244 个文件，2026-10-20 生成）见 [source-snapshot.md](source-snapshot.md)。
+全仓库源码快照（256 个文件，2026-10-22 重算，可复现脚本 `scripts/researchsearch/gen_source_snapshot.py`）见 [source-snapshot.md](source-snapshot.md)。
 
 ## 启动预检
 
@@ -189,14 +189,20 @@ Web 搜索服务使用单独的 retriever 环境。先启动 Redis，设置 BRIG
 - [x] **客户端检索超时/重试/错误分类**（方案 §2.1 阻塞 6 / §4.3）：新增 `search_r1/search/retrieval_client.py`（`post_retrieve` 单次 30s、最多重试 2 次、指数退避、区分 auth/rate_limit/server/network/invalid），`generation.py` / `generation_ts.py` 的 `_batch_search` 改走该客户端；配套 `tests/researchsearch/test_retrieval_client.py`（16 项）。
 - [x] **全仓库源码快照**（Day 1 任务 2 补全）：新增 `docs/researchsearch/source-snapshot.md`，记录 244 个源码文件 SHA-256（排除 .pytest_cache / __pycache__ / 图片二进制）。
 - [x] **T06 loss mask 单元测试**：新增 `tests/researchsearch/test_loss_mask.py`（6 项），加载真实 `_info_masked_concatenate_with_padding` 与 `TensorHelper.create_attention_mask`，锁定 information → pad_id → mask 0 的构造、`loss_mask = info_mask[:, -response_length:]` 切片与 `state_masking` 开关语义。
-- [x] **树内证据奖励接线预备**（方案 Day 5 任务 6 / Day 6 任务 1 无卡部分）：新增 `docs/researchsearch/evidence-wiring.md`，记录字段传递全链路、三个丢失点（pop 只留 3 字段 / `_passages2string` 丢 doc_id / RewardManager 不读证据）与 Day 6 接线蓝图；新增 `evidence.extract_doc_ids_from_retrieval` 纯函数（旁路提取 Wiki `document.id`）；配套 `tests/researchsearch/test_tree_evidence_wiring.py`（6 项，锁定叶子顺序与 `np.repeat` 行序对齐、doc_id 提取、两题不串题）。核心训练路径改动待真实 rollout 验证。
+- [x] **树内证据奖励接线落地**（方案 Day 6 任务 1 无卡部分）：接线代码已落地——`ray_trainer_ts.py` 条件性把 `extra_info` 带入 `gen_batch`、`generation_ts.py` 旁路累积逐叶 `visible_doc_ids` 并在 `reward_fn` 前写入 `final_output`、`RewardManager` 新增 `evidence_alpha` 证据项；配套 `evidence.extract_doc_ids_from_retrieval` / `compute_evidence_reward` / `combine_score_with_evidence` 纯函数与 `tests/researchsearch/test_tree_evidence_wiring.py`（12 项，锁定叶子顺序对齐、doc_id 提取、alpha 语义、`visible_doc_ids` 隔离、端到端不串题）。真实 rollout 逐叶验证与「截断后可见性判定」待 GPU+语料（见 `docs/researchsearch/evidence-wiring.md` §6）。
 - [x] **T07 优势计算路由测试**（方案 Day 5 任务 3）：新增 `tests/researchsearch/test_adv_routing.py`（4 项），加载真实 `ray_trainer_ts.compute_advantage`，锁定 `tree` = 两次 `compute_grpo_outcome_advantage` 相加、`tree_2norm` = 一次 `compute_tree_grpo_outcome_advantage`，二者不同不能混用。
 - [x] **checkpoint 导出参数化**（方案 §6 Day 6 任务 2 / §2.1 阻塞 4）：新增 `scripts/researchsearch/export_ckpt.sh`，通过自身目录定位 `model_merger.py`，参数化 `LOCAL_DIR` / `TARGET_DIR` / `HF_MODEL_PATH` / `BACKEND`，支持 `--dry-run`；旧 `convert_checkpoint_from_verl_to_hf.sh` 标注 deprecated 并指向新脚本；配套 `tests/researchsearch/test_export_ckpt.py`（5 项，缺参数提前失败、dry-run 路径解析、hf_model_path 仅按需透传）。真实合并/加载与确定性推理一致性检查待真实 checkpoint（GPU 阶段）。
 - [x] **Day 1–7 一致性审计修复**（对齐方案 §4.1 / 架构 §4）：① 修正 `build.py` 的 `--dev-flashrag` 错误消费 FlashRAG `test` split（违背「正式测试集锁定」），改为 `_DEV_FLASHRAG_SPLIT="dev"`，并补 3 项测试锁定 dev 优先 dev split、无 dev 回退 train、绝不落 test；② 新增 `evidence.compute_recall_at_k` 纯函数（架构 §4 检索指标：按检索顺序去重后取前 K）+ 5 项测试；③ 补 `test_loss_mask.py` tree 版（`generation_ts`，含 `turns_mask`/`turns`）掩码构造 4 项测试，锁定 information→pad→mask0 与 response content 段=当前 turn 值语义。
+- [x] **树结构验证（Item 2）**：`TreeNode.to_dict` / `export_tree_roots` 树导出由 `tests/researchsearch/test_tree_export.py`（8 项）锁定，共享前缀复用与叶子顺序对齐由 `tests/researchsearch/test_tree_shared_prefix.py`（4 项）锁定。遗留子项「共享前缀 log_prob 对齐」澄清：`TreeNode.log_prob_node` / `log_prob_list` 当前未填充（`generation_ts.py` 建节点时不传这两个参数，保持默认 `0.0` / `[]`），但训练不依赖它们——`ray_trainer_ts.py:887` 对拼好共享前缀的完整轨迹逐 token `compute_log_prob` 得到 `old_log_probs`，论文重要性比率同样是逐 token 计算，故无需先把推理 log_prob 归约成节点分数；`_get_action_log_probs` 算出的 `log_probs_step` 仅是生成侧统计，不进入节点字段。
+- [x] **Web 缓存命名空间 + 预算口径统计 + 结构化失败状态与旁路元数据**（方案 Day 6 任务 3 / 门禁 T10 无卡部分）：`bing_search_server_redis.py` 的 `OnlineSearchEngine` 缓存键从裸 `query` 改为 `{provider}:{zone}:{cache_version}:{max_results}:{result_length}:{query}`（`_cache_key`，换 provider/zone/版本/topk 后旧缓存不命中）；新增 `get_stats()` 三口径分开统计——`logical_queries`（Agent 逻辑搜索，每个 query 一次）/`cache_hits`（Redis 命中）/`api_requests`（真实 HTTP 请求，含重试），`execute_with_retry` 达上限终止；`execute` 改为生成 `SearchOutcome`（status/text/items/error_code），`get_last_outcome()` 暴露结构化失败分类（success/not_found/rate_limit/network/server/invalid/auth/empty_query）与 `items` 旁路（rank/title/url/description），鉴权错误立即失败不重试，模型可见返回形状不变。配套 `tests/researchsearch/test_web_cache_budget.py`（19 项，mock redis/fastapi/langid/uvicorn，fixture 锁定命名空间隔离、三口径与失败分类）。
+- [x] **源码快照可复现化（B-8）**：新增 `scripts/researchsearch/gen_source_snapshot.py`，对 Tree-GRPO-main 下排除 `.git`/`.pytest_cache`/`__pycache__`/`.DS_Store`/二进制图片的所有文件计算 SHA-256 并写 `docs/researchsearch/source-snapshot.md`；本次重算 256 个文件（2026-10-22），后续任何改动后一条命令即可重算，取代此前一次性命令。
+- [x] **第 1 周报告框架（B-7）**：新增 `docs/researchsearch/week1-report.md`，含目标/结论速览、对照方案 §9 的 14 项完成清单、T01–T10 门禁对照、从空环境到 smoke 结果的运行说明、结果表/失败案例占位、第二周任务与三档资源估算方法、交付检查表与待回填清单；GPU/真实服务数据回来后填实结果表（§5）、失败案例（§6）与资源估算数值（§7.2），不预填任何提升数值。
+- [x] **真实 GPU 三段 smoke + 结果回填（B-7 后半）**：AutoDL A800 单卡跑通 E0（val_only 逐题导出 `e0_3.json`，4 turn 全 invalid / 0 搜索 / ~74s）、GRPO（2 步，critic 0.600，finish_ratio 0.875，76.6s/step，MFU 0.120，验证 0.0）、Tree（M2/N2/L1/K3，1 步，critic 0.254，pg_loss 0.129，grad_norm 2.085，104.8s/step，MFU 0.234，最终验证 1.0），训练闭环（rollout→优势→更新→checkpoint 保存）验证通过，T06/T08 转 ✅。关键资源发现：单卡 NO_SHARD 每步 FSDP checkpoint ≈36G（optim 23G + model 13G），80G 数据盘仅容 2 个完整 checkpoint，verl 恒保存 optimizer 且 `total_training_steps=1` 仍落 2 个 checkpoint；smoke 后删 optimizer 状态、保留 4 个 model 权重（GRPO/Tree 各 2 step）供 T09 导出。结果表/失败案例/资源估算已回填 `docs/researchsearch/week1-report.md` §5–§7。
+- [x] **T09 checkpoint 导出验证 + `model_merger.py` 兼容修复**：发现并修复 `scripts/merge_ckpt/model_merger.py` 与 verl 0.8.5 的两个兼容性 bug——① `from verl.utils import hf_processor` 在 verl 0.8.5 无此符号（改 `try/except` 兜底 `None`，纯文本模型不需要 processor）；② verl 0.8.5 把 config/tokenizer 存到 `{local_dir}/huggingface/` 子目录，merger 原先 `AutoConfig.from_pretrained(local_dir)` 读不到（新增 `_resolve_hf_config_path` 优先指向 huggingface/ 子目录）。修复后用 `export_ckpt.sh --merge` 将 tree step1 完整 checkpoint 导出为 HF（`model.safetensors` 2 分片共 6.8G + config/tokenizer/generation_config），`AutoModelForCausalLM.from_pretrained` 重载成功（qwen2 / 3.09B 参数），生成 `"The largest planet ... is Jupiter ..."` 正确。tree step2 因磁盘满缺 `huggingface/` 子目录不可导出，仅 3 个完整 checkpoint（grpo step1/2、tree step1）。随后清理 39G（删 tree step2 残骸、已导出的 tree step1、重复的 grpo step1），并导出 grpo step2 → `merged/grpo-step2-hf`（重载 3.09B 参数成功）。现数据盘 32G used / 49G free，保留 grpo step2 原始 FSDP 分片 + 两个导出 HF（tree-step1-hf、grpo-step2-hf）+ 原始模型 models/。
 
 ### 测试状态
 
-91 项全部通过：`data_build` 14（T01 + FlashRAG split 锁定）+ `reward_format` 14（T04）+ `evidence` 13（T05 + Recall@K）+ `core_algos` 9（T07）+ `retrieval_client` 16（T03 客户端）+ `loss_mask` 10（T06 chain + tree）+ `adv_routing` 4（T07 路由）+ `tree_evidence_wiring` 6（Day 6 预备）+ `export_ckpt` 5（T09 脚本）。
+234 项（233 通过 + 1 xfail）：`data_build` 14（T01 + FlashRAG split 锁定）+ `reward_format` 14（T04）+ `evidence` 22（T05 + Recall@K + 截断后可见判定）+ `core_algos` 9（T07）+ `retrieval_client` 16（T03 客户端）+ `retrieval_server` 11（T03 服务端格式层，1 xfail 记录 return_scores=false 缺陷）+ `loss_mask` 10（T06 chain + tree）+ `adv_routing` 4（T07 路由）+ `tree_evidence_wiring` 12（Day 6 接线）+ `export_ckpt` 5（T09 脚本）+ `e0_export` 8 + `tree_export` 8 + `tree_shared_prefix` 4 + `web_cache_budget` 19（B-5 命名空间 + B-6 预算口径 + 缺口 2/3 失败分类与旁路）+ `cost_stats` 13（T10 统一口径：六口径字段 / 累加器 / 共享前缀物理 token / checkpoint 体积 / 检索侧逻辑搜索与外部请求分开）+ `eval_metrics` 27（E06 评测评分器 + E07 消融：归一化一致 / EM/F1 别名 / 宏平均 / Multi-Hop Avg EM / bootstrap CI / pairwise_ablation）+ `eval_runner` 16（Day 7 评测编排 + E06/E07：schema 校验 / EM 独立于训练奖励 / Recall@K 与证据集合分离 / 可映射比例分母 / Multi-Hop Avg EM 缺项不静默 / 消融题目配对）+ `eval_manifest` 11（Day 7 manifest 预注册骨架：四数据集完整性强制 / 只读哈希 / 篡改校验 / 摘要）+ `evidence_map` 11（Day 1 evidence_map_fn：四态判定 / 歧义不猜测 / 语料缺失不误判 / 去重）。
 
 ### 门禁对照
 
@@ -204,20 +210,20 @@ Web 搜索服务使用单独的 retriever 环境。先启动 Redis，设置 BRIG
 |---|---|---|
 | T01 分组/索引 | ✅ | build.py 全局唯一 index + dev split 锁定（不消费 test），data_build 覆盖 |
 | T02 证据映射 | ⛔ | 依赖真实 FlashRAG 语料/索引 |
-| T03 检索契约 | 🟡 | 客户端超时/重试/错误分类已完成（16 项）；服务端批量顺序、doc_id 仍需真实索引 |
+| T03 检索契约 | 🟡 | 客户端超时/重试/错误分类（16 项）+ 服务端格式层契约用 fake retriever 交付（11 项，含 1 xfail 缺陷记录）；批量结果顺序稳定、doc_id 回查正文仍需真实索引 |
 | T04 分段奖励 | ✅ | 14 项测试锁定语义 |
-| T05 证据奖励 | ✅ | evidence.py + 13 项测试（R_evidence 8 + Recall@K 5）+ doc_id 提取纯函数 + 接线预备测试 |
-| T06 loss mask | 🟡 | 静态分析 + 单元测试完成（10 项：chain 6 + tree 4），运行时断言待真实 rollout |
+| T05 证据奖励 | ✅ | evidence.py + 22 项测试（R_evidence 8 + Recall@K 5 + 截断后可见判定 9）+ doc_id 提取纯函数 + 树内接线测试（tree_evidence_wiring 12） |
+| T06 loss mask | ✅ | 静态分析 + 单元测试完成（10 项：chain 6 + tree 4）+ Tree smoke 运行时 `state_tokens/coverage 0.771` 观察通过 |
 | T07 优势计算 | ✅ | 9 项 core_algos + 4 项路由测试锁定 |
-| T08 权重更新 | ⛔ | 需真实 GPU rollout 与 optimizer step |
-| T09 checkpoint | 🟡 | 导出脚本已参数化（5 项）；真实合并/加载/下一阶段更新待真实 checkpoint |
-| T10 预算 | ⛔ | 需真实 rollout 统计缓存/重试/逻辑调用 |
+| T08 权重更新 | ✅ | GRPO 2 步 / Tree 1 步真实 optimizer 更新，`grad_norm` 非零，checkpoint 保存（见 week1-report §5） |
+| T09 checkpoint | 🟡 | 导出脚本参数化（5 项）+ `model_merger.py` 兼容 verl 0.8.5 修复；真实导出/加载已验证（tree step1→HF，重载 3.09B 参数、推理 Jupiter 正确）；Web warm start（下一阶段更新）待真实检索 |
+| T10 预算 | 🟡 | 缓存命名空间 + 三口径统计（logical_queries/cache_hits/api_requests）+ 上限终止已用 fixture 测试锁定（web_cache_budget 19）；统一六口径 `cost_stats`（CostStats / 共享前缀物理 token 纯函数 / checkpoint 体积 / 检索侧逻辑搜索与外部请求分开，13 项，见 [cost-stats.md](./cost-stats.md)）；真实 rollout 填数与 GPU 时间仍待 GPU+检索服务 |
 
 ### 剩余阻塞项
 
-- [ ] 核验 Ray runtime_env 在 worker 上分发代码及模型、数据路径（GPU 已就位，两环境已装，三段 smoke 已通过；Ray 探针尚未提交）。
+- [x] 核验 Ray runtime_env 在 worker 上分发代码及模型、数据路径（三段 smoke 均经 Ray job submit + runtime_env 跑通，代码/模型/数据路径分发验证通过）。
 - [ ] 补装 retriever 环境 faiss-gpu（1.7.3 为版本笔误，改用 PyPI 可用版本 1.7.2 / 1.14.3 等），随后配置检索/Web 服务并记录一次真实搜索请求。
 - [ ] 真实 FlashRAG 语料/索引就绪后：生成 128/64 条 smoke parquet + manifest，补齐 `doc_id` 与证据映射报告。
-- [ ] 检索服务就绪后：执行 `/retrieve` 契约测试。
-- [ ] 证据奖励接入树内回调（Day 6）：接线蓝图与预备测试已交付（`docs/researchsearch/evidence-wiring.md` + `test_tree_evidence_wiring.py`），核心路径改动（pop 增字段 → 逐叶 `visible_doc_ids` → RewardManager 证据项）待真实 rollout 验证。
-- [ ] loss mask 运行时断言（真实 rollout）。
+- [ ] 检索服务就绪后：执行真实检索层契约测试（批量顺序稳定、doc_id 回查正文、中英文字符、服务不可用）；格式层契约已用 fake retriever 交付（`test_retrieval_server.py`）。
+- [ ] 证据奖励真实 rollout 验证（Day 6 后半）：无卡接线已落地（pop 增字段 → 逐叶 `visible_doc_ids` → RewardManager 证据项，见 `docs/researchsearch/evidence-wiring.md`）；真实 rollout 逐叶验证、`alpha>0` 更新、「截断后可见性判定」待 GPU+语料+检索服务。
+- [x] loss mask 运行时断言（真实 rollout）：Tree smoke 运行时 `state_tokens/coverage 0.771` 观察通过（tree 路径；chain 路径由 10 项单测覆盖）。

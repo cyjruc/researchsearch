@@ -98,6 +98,11 @@ def _load_ray_trainer_ts():
             "LLMGenerationManager": type("LLMGenerationManager", (), {}),
             "GenerationConfig": type("GenerationConfig", (), {}),
         }),
+        ("search_r1.search", {}),
+        ("search_r1.search.cost_stats", {
+            "CostStats": type("CostStats", (), {}),
+            "directory_size_bytes": lambda *a, **k: 0,
+        }),
     )
     for name, attrs in mocks:
         mod = sys.modules.get(name)

@@ -3,8 +3,7 @@
 对齐方案 T01（数据隔离与分组 ID）以及 §4.2 的样本结构约定。
 """
 
-import sys
-import types
+import json
 
 import pytest
 
@@ -12,6 +11,7 @@ from researchsearch.data.build import (
     EVIDENCE_STATUSES,
     _DEV_FLASHRAG_SPLIT,
     _TRAIN_FLASHRAG_SPLIT,
+    _sample_records,
     build_dataset,
     build_sample,
     load_flashrag_source,
@@ -194,6 +194,17 @@ def test_manifest_consistent_with_samples():
     ]
 
 
+def test_manifest_records_seed():
+    train = [make_record("hotpotqa", 0, "Question A?", ["A"])]
+    result = build_dataset(train, [], start_index=0, seed=42)
+    assert result["manifest"]["seed"] == 42
+
+
+def test_manifest_seed_defaults_none():
+    result = build_dataset([], [], start_index=0)
+    assert result["manifest"]["seed"] is None
+
+
 def test_evidence_statuses_enum_unchanged():
     # 防止意外改动破坏方案 §4.2 约定的四种状态
     assert EVIDENCE_STATUSES == ("mapped", "partial", "unmapped", "not_available")
@@ -203,35 +214,71 @@ def test_evidence_statuses_enum_unchanged():
 
 
 def test_flashrag_split_constants_never_use_test():
-    # dev 数据源只能取官方 dev（或回退 train），绝不消费 test split。
+    # dev 数据源只能取官方 dev，绝不消费 test split。
     assert _TRAIN_FLASHRAG_SPLIT == "train"
     assert _DEV_FLASHRAG_SPLIT == "dev"
 
 
-def test_load_flashrag_dev_prefers_dev_over_test(monkeypatch):
-    # dev 数据源传入 "dev" 时，即使数据集同时有 test，也只取 dev split。
-    rows = {
-        "train": [{"id": "t0", "question": "train question?", "golden_answers": ["t"]}],
-        "dev": [{"id": "d0", "question": "dev question?", "golden_answers": ["d"]}],
-        "test": [{"id": "x0", "question": "test question?", "golden_answers": ["x"]}],
-    }
-    fake = types.ModuleType("datasets")
-    fake.load_dataset = lambda dataset_dir, data_source: rows
-    monkeypatch.setitem(sys.modules, "datasets", fake)
-
-    records = load_flashrag_source("/tmp/x", "hotpotqa", _DEV_FLASHRAG_SPLIT)
+def test_load_flashrag_reads_jsonl(tmp_path):
+    # FlashRAG 是 JSONL 直存：<dir>/<data_source>/<split>.jsonl。
+    d = tmp_path / "hotpotqa"
+    d.mkdir()
+    (d / "dev.jsonl").write_text(
+        json.dumps({"id": "d0", "question": "dev question?", "golden_answers": ["d"]}) + "\n",
+        encoding="utf-8",
+    )
+    records = load_flashrag_source(str(tmp_path), "hotpotqa", _DEV_FLASHRAG_SPLIT)
     assert [r["question"] for r in records] == ["dev question?"]
+    assert records[0]["source_id"] == "d0"
 
 
-def test_load_flashrag_dev_falls_back_to_train_not_test(monkeypatch):
-    # 数据集无 dev split 时回退 train（配合泄漏检测兜底），绝不落到 test。
-    rows = {
-        "train": [{"id": "t0", "question": "train question?", "golden_answers": ["t"]}],
-        "test": [{"id": "x0", "question": "test question?", "golden_answers": ["x"]}],
+def test_load_flashrag_missing_split_raises(tmp_path):
+    # split 对应 JSONL 不存在时直接报错，不悄悄回退到其他 split（保持 train/dev 隔离）。
+    d = tmp_path / "hotpotqa"
+    d.mkdir()
+    (d / "train.jsonl").write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="没有 split"):
+        load_flashrag_source(str(tmp_path), "hotpotqa", _DEV_FLASHRAG_SPLIT)
+
+
+def test_load_flashrag_source_applies_evidence_map_fn(tmp_path):
+    # evidence_map_fn(example, idx) 的返回字段写入 supporting_doc_ids / evidence_status。
+    d = tmp_path / "hotpotqa"
+    d.mkdir()
+    example = {
+        "id": "d0",
+        "question": "dev question?",
+        "golden_answers": ["d"],
+        "metadata": {"supporting_facts": {"title": ["Paris"], "sent_id": [0]}},
     }
-    fake = types.ModuleType("datasets")
-    fake.load_dataset = lambda dataset_dir, data_source: rows
-    monkeypatch.setitem(sys.modules, "datasets", fake)
+    (d / "dev.jsonl").write_text(json.dumps(example) + "\n", encoding="utf-8")
 
-    records = load_flashrag_source("/tmp/x", "hotpotqa", _DEV_FLASHRAG_SPLIT)
-    assert [r["question"] for r in records] == ["train question?"]
+    def evidence_map_fn(example, idx):
+        return {"supporting_doc_ids": ["wiki:Paris"], "evidence_status": "mapped"}
+
+    records = load_flashrag_source(
+        str(tmp_path), "hotpotqa", _DEV_FLASHRAG_SPLIT, evidence_map_fn=evidence_map_fn
+    )
+    assert records[0]["supporting_doc_ids"] == ["wiki:Paris"]
+    assert records[0]["evidence_status"] == "mapped"
+
+
+def test_sample_records_deterministic():
+    records = [make_record("nq", i, f"Q{i}?", ["A"]) for i in range(10)]
+    a = _sample_records(records, 4, seed=42)
+    b = _sample_records(records, 4, seed=42)
+    assert [r["source_index"] for r in a] == [r["source_index"] for r in b]
+
+
+def test_sample_records_n_gte_len_takes_all():
+    records = [make_record("nq", i, f"Q{i}?", ["A"]) for i in range(3)]
+    out = _sample_records(records, 5, seed=0)
+    assert [r["source_index"] for r in out] == [0, 1, 2]
+
+
+def test_sample_records_sorted_by_source_index():
+    records = [make_record("nq", i, f"Q{i}?", ["A"]) for i in range(10)]
+    out = _sample_records(records, 3, seed=7)
+    idxs = [r["source_index"] for r in out]
+    assert idxs == sorted(idxs)
+    assert len(idxs) == 3

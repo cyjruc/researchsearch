@@ -19,8 +19,9 @@
 1. 叶子顺序对齐：``final_node_list`` 按 root 分组、每组 ``k`` 个叶子，与
    ``gen_batch.repeat(k, interleave=True)`` 的行序（``np.repeat``）一一对应，
    因此证据字段沿根样本 repeat 传播后，其行序与叶子顺序天然对齐、不串题。
-2. doc_id 提取：Wiki 检索原始返回里的 ``document.id`` 需旁路保留（``_passages2string``
-   目前丢弃它），由 ``evidence.extract_doc_ids_from_retrieval`` 提取。
+2. doc_id 提取：Wiki 检索原始返回里的文档需旁路保留（``_passages2string`` 目前丢弃
+   稳定 id），由 ``evidence.extract_doc_ids_from_retrieval`` 提取 title 级 doc_id
+   （``wiki:<title>``，第 2 周 §3.2 决策）。
 3. 证据奖励不串题：两题金标准证据不同、分支检索结果不同，逐叶计算互不影响。
 
 本文件真实加载 ``tree_node.py``（mock 掉 pydantic / verl），并复用已交付的
@@ -156,7 +157,7 @@ def test_leaf_order_aligns_with_interleaved_repeat():
 def test_extract_doc_ids_preserves_order_and_skips_missing():
     result = [
         {"document": {"id": "wiki:1", "contents": "a\nb"}, "score": 0.9},
-        {"document": {"contents": "no id"}, "score": 0.8},
+        {"document": {"text": "no title, no id"}, "score": 0.8},
         {"document": {"id": "wiki:2", "contents": "c\nd"}, "score": 0.7},
         "not a doc dict",
     ]
@@ -214,3 +215,102 @@ def test_evidence_reward_end_to_end_from_retrieval_result():
     assert res["num_covered"] == 1
     assert res["num_retrieval_hit"] == 1  # wiki:2 被截断，不计入分子但单独报告
     assert res["visible_doc_ids"] == ["wiki:1", "wiki:9"]
+
+
+# --- combine_score_with_evidence 加权语义（Day 6 任务 1） ---------------------
+
+combine_score_with_evidence = _evidence.combine_score_with_evidence
+
+
+def test_combine_score_alpha_zero_returns_base_unchanged():
+    # alpha=0 证据项完全关闭，无论 evidence 内容如何都原样返回 base。
+    assert combine_score_with_evidence(0.8, {"score": 1.0, "eligible": True}, 0.0) == pytest.approx(0.8)
+    assert combine_score_with_evidence(1.0, {"score": 0.0, "eligible": False}, 0.0) == pytest.approx(1.0)
+
+
+def test_combine_score_alpha_positive_adds_weighted_evidence():
+    # R_total = R_existing + alpha * R_evidence。
+    assert combine_score_with_evidence(0.8, {"score": 0.6, "eligible": True}, 0.5) == pytest.approx(0.8 + 0.5 * 0.6)
+
+
+def test_combine_score_non_eligible_contributes_zero():
+    # eligible=False 时 score 恒为 0，合并结果等于 base，避免非 mapped 样本虚增。
+    assert combine_score_with_evidence(0.9, {"score": 0.0, "eligible": False}, 1.0) == pytest.approx(0.9)
+
+
+# --- TreeNode.visible_doc_ids 累积与默认值隔离 -------------------------------
+
+
+def test_tree_node_visible_doc_ids_default_independent():
+    # 缺省必须各自持有独立空列表，避免可变默认参数被所有实例共享。
+    a = _make_leaf("t0", "a")
+    b = _make_leaf("t0", "b")
+    assert a.visible_doc_ids == []
+    assert b.visible_doc_ids == []
+    a.visible_doc_ids.append("wiki:x")
+    assert b.visible_doc_ids == []
+
+
+def test_tree_node_visible_doc_ids_preserved_and_exported():
+    # 显式传入的可见集合应保留，且 to_dict 序列化为拷贝（不泄露内部可变引用）。
+    node = TreeNode(
+        tree_uid="t0",
+        node_uid="n0",
+        is_root=False,
+        depth=1,
+        is_leaf=True,
+        reward_mode="base",
+        visible_doc_ids=["wiki:1", "wiki:2"],
+    )
+    assert node.visible_doc_ids == ["wiki:1", "wiki:2"]
+    exported = node.to_dict()
+    assert exported["visible_doc_ids"] == ["wiki:1", "wiki:2"]
+    # to_dict 返回拷贝，改导出结果不影响节点内部状态。
+    exported["visible_doc_ids"].append("wiki:9")
+    assert node.visible_doc_ids == ["wiki:1", "wiki:2"]
+
+
+# --- 端到端证据合并不串题（RewardManager.__call__ 的证据段） ------------------
+
+
+def test_evidence_merge_end_to_end_no_cross_contamination():
+    # 复刻 RewardManager.__call__ 的证据段：对每个 data_item 读
+    # extra_info(supporting_doc_ids, evidence_status) + visible_doc_ids，
+    # 计算 R_evidence 后按 alpha 加权叠加到已有 score。两题 gold/可见集合
+    # 不同，合并结果互不影响。
+    alpha = 0.5
+
+    def merge(base_score, extra_info, visible_doc_ids):
+        gold = extra_info.get("supporting_doc_ids", [])
+        status = extra_info.get("evidence_status", "mapped")
+        res = compute_evidence_reward(
+            gold_doc_ids=gold,
+            visible_doc_ids=visible_doc_ids,
+            evidence_status=status,
+        )
+        return combine_score_with_evidence(base_score, res, alpha)
+
+    # 题 A：gold 2，可见命中 1 -> 证据 0.5；base 0.8 -> 1.05。
+    a = merge(
+        0.8,
+        {"supporting_doc_ids": ["wiki:1", "wiki:2"], "evidence_status": "mapped"},
+        ["wiki:1", "wiki:3"],
+    )
+    # 题 B：gold 2，可见命中 2 -> 证据 1.0；base 0.6 -> 1.1。
+    b = merge(
+        0.6,
+        {"supporting_doc_ids": ["wiki:10", "wiki:11"], "evidence_status": "mapped"},
+        ["wiki:10", "wiki:11"],
+    )
+    # 题 C：缺 gold -> eligible=False，证据项 0，base 原样。
+    c = merge(
+        0.4,
+        {"supporting_doc_ids": [], "evidence_status": "mapped"},
+        ["wiki:20"],
+    )
+
+    assert a == pytest.approx(0.8 + 0.5 * 0.5)
+    assert b == pytest.approx(0.6 + 0.5 * 1.0)
+    assert c == pytest.approx(0.4)
+    # 三者证据完全独立，不串题。
+    assert a != b

@@ -42,6 +42,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 import re
 from search_r1.llm_agent.generation_ts import LLMGenerationTreeSearchManager, GenerationTreeSearchConfig
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+from search_r1.search.cost_stats import CostStats, directory_size_bytes
 
 WorkerType = Type[Worker]
 
@@ -458,6 +459,9 @@ class RayPPOTrainer(object):
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        # 六口径成本累加器（T10）：fit 累计 GPU 秒与 checkpoint 体积，rollout 侧
+        # generation_manager 累计物理 token / 逻辑搜索 / 外部请求。
+        self.cost_stats = CostStats()
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -753,6 +757,8 @@ class RayPPOTrainer(object):
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, 'actor')
         self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
+        # 记录 checkpoint 磁盘体积（T10；真实分片下需实测核对目录已落盘）。
+        self.cost_stats.add_checkpoint_bytes(directory_size_bytes(actor_local_path))
 
         if self.use_critic:
             critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
@@ -825,6 +831,7 @@ class RayPPOTrainer(object):
             actor_rollout_wg=self.actor_rollout_wg,
             reward_fn=self.reward_fn,
             config=gen_config,
+            cost_stats=self.cost_stats,
         )
 
         # start training loop
@@ -839,10 +846,14 @@ class RayPPOTrainer(object):
                 ## Repeat for tree search, [BS, ] -> [BS*m, ]
                 batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.ts_m, interleave=True)
                 batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
-                # pop those keys for generation
+                # pop those keys for generation；证据字段（extra_info.supporting_doc_ids /
+                # evidence_status）需随生成 batch 进入树采样，供树内证据奖励按叶子读取。
+                non_tensor_batch_keys = ['uid', 'data_source', 'reward_model']
+                if 'extra_info' in batch.non_tensor_batch:
+                    non_tensor_batch_keys.append('extra_info')
                 gen_batch = batch.pop(
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['uid', 'data_source', 'reward_model'],
+                        non_tensor_batch_keys=non_tensor_batch_keys,
                     )
                 gen_batch.batch['prompts'] = gen_batch.batch['input_ids']
 
@@ -982,6 +993,10 @@ class RayPPOTrainer(object):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, reward_mode=self.config.actor_rollout_ref.rollout.reward_mode))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # 累计并上报六口径成本（T10）：step 墙钟秒计入 GPU 时间；物理 token /
+                # 逻辑搜索 / 外部请求已由 rollout 侧累加进同一 cost_stats。
+                self.cost_stats.add_gpu_seconds(timing_raw.get('step', 0.0))
+                metrics.update(self.cost_stats.as_dict())
                 print(self.global_steps, metrics)
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

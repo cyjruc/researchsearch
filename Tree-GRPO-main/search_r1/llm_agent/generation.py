@@ -2,6 +2,7 @@ import torch
 import re
 from collections import defaultdict
 import os
+import json
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
@@ -24,6 +25,66 @@ class GenerationConfig:
     no_think_rl: bool=False
     search_url: str = None
     topk: int = 3
+
+
+def export_e0_trajectories(trajectories, non_tensor, export_dir):
+    """E0 逐题导出（Day 3 任务 1/2）。
+
+    把 ``run_llm_loop`` 累积的逐题轨迹与题目元信息（index / data_source /
+    gold_answers）合并，每条题写一个独立 JSON，供离线核对「至少一条真实轨迹
+    完成两轮搜索」的验收。轨迹本体在 ``is_validation`` 时累积，由调用方用
+    ``E0_EXPORT_DIR`` 环境变量门控后调用。
+    """
+    if not trajectories:
+        return []
+
+    n = len(trajectories)
+
+    def _col(key):
+        vals = non_tensor.get(key)
+        if vals is None:
+            return [None] * n
+        if hasattr(vals, 'tolist'):
+            vals = vals.tolist()
+        return vals
+
+    def _jsonable(value):
+        """把 numpy 标量/数组转成 JSON 可序列化的 Python 原生类型。"""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if hasattr(value, 'tolist'):
+            return value.tolist()
+        if isinstance(value, dict):
+            return {k: _jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_jsonable(v) for v in value]
+        return value
+
+    indexes = _col('index')
+    data_sources = _col('data_source')
+    reward_models = _col('reward_model')
+
+    os.makedirs(export_dir, exist_ok=True)
+    paths = []
+    for i in range(n):
+        rm = reward_models[i] if i < len(reward_models) and reward_models[i] is not None else {}
+        gold = None
+        if isinstance(rm, dict):
+            gold = (rm.get('ground_truth') or {}).get('target')
+
+        record = _jsonable(dict(trajectories[i]))
+        record['index'] = int(indexes[i]) if i < len(indexes) and indexes[i] is not None else None
+        record['data_source'] = _jsonable(data_sources[i]) if i < len(data_sources) else None
+        record['gold_answers'] = _jsonable(gold)
+
+        idx = record['index'] if record['index'] is not None else i
+        path = os.path.join(export_dir, f'e0_{idx}.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        paths.append(path)
+
+    return paths
+
 
 class LLMGenerationManager:
     def __init__(
@@ -241,6 +302,38 @@ class LLMGenerationManager:
         rollings = gen_batch
         rollout_token_cnt = 0
 
+        # E0 逐题导出（Day 3 任务 1/2）：仅在 validate 时累积逐题轨迹，训练路径零开销。
+        # 轨迹随后写入 meta_info，由 ray_trainer._validate 用 E0_EXPORT_DIR 门控写盘。
+        trajectories = None
+        if self.is_validation:
+            batch_size = gen_batch.batch['input_ids'].shape[0]
+            trajectories = [{
+                "turns": [],
+                "stop_reason": "max_turns",
+                "final_answer": None,
+                "_done": False,
+            } for _ in range(batch_size)]
+
+            def record_step(step, responses_str, next_obs, dones, valid_action, is_search, active_mask):
+                """把一轮 rollout 的动作/查询/观察/有效性记入对应题目的轨迹。"""
+                actions, contents = self.postprocess_predictions(responses_str)
+                for i in range(batch_size):
+                    if not active_mask[i].item():
+                        continue
+                    trajectories[i]["turns"].append({
+                        "step": step,
+                        "action": actions[i],
+                        "content": contents[i],
+                        "observation": next_obs[i],
+                        "valid": int(valid_action[i]),
+                        "is_search": int(is_search[i]),
+                        "done": int(dones[i]),
+                    })
+                    if dones[i]:
+                        trajectories[i]["_done"] = True
+                    if actions[i] == "answer":
+                        trajectories[i]["final_answer"] = contents[i]
+
         # Main generation loop
         for step in range(self.config.max_turns):
             if not active_mask.sum():
@@ -267,7 +360,9 @@ class LLMGenerationManager:
             next_obs, dones, valid_action, is_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
-            
+            if trajectories is not None:
+                record_step(step, responses_str, next_obs, dones, valid_action, is_search, active_mask)
+
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
@@ -310,9 +405,11 @@ class LLMGenerationManager:
                 rollout_token_cnt += gen_output.batch['responses'].shape[0] * gen_output.batch['responses'].shape[1]
 
             # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
+            next_obs, dones, valid_action, is_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=False
             )
+            if trajectories is not None:
+                record_step(self.config.max_turns, responses_str, next_obs, dones, valid_action, is_search, active_mask)
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -328,12 +425,24 @@ class LLMGenerationManager:
             )
 
         dprint(f"ROLLOUT_TOKEN_CNT={rollout_token_cnt}")
-        
+
+        # 定稿结束原因与工具成本，并清掉内部 _done 标记。
+        if trajectories is not None:
+            for i, traj in enumerate(trajectories):
+                done = traj.pop("_done")
+                traj["stop_reason"] = "answer" if done else "max_turns"
+                traj["tool_cost"] = {
+                    "turns": int(turns_stats[i]),
+                    "searches": int(valid_search_stats[i]),
+                    "valid_actions": int(valid_action_stats[i]),
+                }
+
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
-        
+        meta_info['trajectories'] = trajectories if trajectories is not None else []
+
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
         return self._compose_final_output(original_left_side, original_right_side, meta_info)

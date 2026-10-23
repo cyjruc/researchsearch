@@ -14,7 +14,9 @@ import numpy as np
 
 from search_r1.search.retrieval_client import post_retrieve
 
-from .tree_node import TreeNode, DEBUG, dprint
+from .tree_node import TreeNode, DEBUG, dprint, export_tree_roots
+from verl.utils.reward_score.evidence import extract_doc_ids_from_retrieval
+from search_r1.search.cost_stats import physical_new_tokens_from_tree
 
 
 @dataclass
@@ -43,12 +45,15 @@ class LLMGenerationTreeSearchManager:
         reward_fn,
         config: GenerationTreeSearchConfig,
         is_validation: bool = False,
+        cost_stats=None,
     ):
         self.tokenizer = tokenizer
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
         self.reward_fn = reward_fn
+        # 六口径成本累加器（T10）；None 时向后兼容、不统计。
+        self.cost_stats = cost_stats
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -377,7 +382,7 @@ class LLMGenerationTreeSearchManager:
             #     log_probs = self.actor_rollout_wg.compute_log_prob()
 
             # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
+            next_obs, dones, valid_action, is_search, search_doc_ids = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, need_act_mask
             )
             
@@ -423,6 +428,8 @@ class LLMGenerationTreeSearchManager:
                 parent_node = tmp_node_list[i]
                 prompts = parent_node.prompts
                 tree_uid = parent_node.tree_uid
+                # 沿父链累积完整可见文档 ID（共享前缀 + 本步检索返回）。
+                visible_doc_ids = parent_node.visible_doc_ids + search_doc_ids[i]
 
                 new_node = TreeNode(
                     tree_uid=tree_uid,
@@ -434,6 +441,7 @@ class LLMGenerationTreeSearchManager:
                     responses=responses,
                     responses_with_info_mask=responses_with_info_mask,
                     turns_mask=turns_mask,
+                    visible_doc_ids=visible_doc_ids,
                     parent_node=parent_node,
                     is_root=False,
                     is_active=bool(curr_active_mask[i].item()),
@@ -478,7 +486,7 @@ class LLMGenerationTreeSearchManager:
                 rollout_token_cnt += gen_output.batch['responses'].shape[0] * gen_output.batch['responses'].shape[1]
 
             # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
+            _, dones, valid_action, is_search, search_doc_ids = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=False
             )
 
@@ -520,6 +528,8 @@ class LLMGenerationTreeSearchManager:
                 parent_node = tmp_node_list[i]
                 prompts = parent_node.prompts
                 tree_uid = parent_node.tree_uid
+                # final 轮无新检索，保持父节点可见集合。
+                visible_doc_ids = parent_node.visible_doc_ids + search_doc_ids[i]
 
                 new_node = TreeNode(
                     tree_uid=tree_uid,
@@ -531,6 +541,7 @@ class LLMGenerationTreeSearchManager:
                     responses=responses,
                     responses_with_info_mask=responses_with_info_mask,
                     turns_mask=turns_mask,
+                    visible_doc_ids=visible_doc_ids,
                     parent_node=parent_node,
                     is_root=False,
                     is_active=bool(curr_active_mask[i].item()),
@@ -552,9 +563,56 @@ class LLMGenerationTreeSearchManager:
         # for i in range(len(tmp_node_list)):
         #     tmp_node_list[i].set_leaf_original_score(original_scores[i])
 
+    @staticmethod
+    def _export_leaf_evidence(final_output, visible_doc_ids_list, export_dir):
+        """逐叶证据导出（T02/T05 真实验证，EVIDENCE_EXPORT_DIR 门控，默认关闭）。
+
+        把每片叶子的 sample_id / gold(supporting_doc_ids) / evidence_status /
+        visible_doc_ids / uid / tree_uid 落盘为 leaf_evidence.json，供离线核对
+        「两题不串题 + 覆盖率非零」。行序与 visible_doc_ids_list 对齐（BS×M×K，
+        与 final_output 一致），字段经 .get 安全降级，缺失不影响训练。
+        """
+        import json as _json
+
+        def _jsonable(o):
+            # parquet 的 extra_info 字段（sample_id/supporting_doc_ids 等）经 tensordict
+            # 读出仍是 numpy 标量/数组，json.dump 会炸，统一转 Python 原生类型。
+            import numpy as _np
+            if isinstance(o, _np.ndarray):
+                return o.tolist()
+            if isinstance(o, (_np.integer, _np.floating, _np.bool_)):
+                return o.item()
+            if isinstance(o, dict):
+                return {k: _jsonable(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)):
+                return [_jsonable(v) for v in o]
+            return o
+
+        os.makedirs(export_dir, exist_ok=True)
+        extra_infos = final_output.non_tensor_batch.get('extra_info')
+        tree_uids = final_output.non_tensor_batch.get('tree_uid')
+        uids = final_output.non_tensor_batch.get('uid')
+        n = len(visible_doc_ids_list)
+        rows = []
+        for i in range(n):
+            ei = extra_infos[i] if extra_infos is not None and isinstance(extra_infos[i], dict) else {}
+            rows.append({
+                'leaf_index': i,
+                'uid': str(uids[i]) if uids is not None else None,
+                'tree_uid': tree_uids[i] if tree_uids is not None else None,
+                'sample_id': ei.get('sample_id'),
+                'evidence_status': ei.get('evidence_status'),
+                'supporting_doc_ids': ei.get('supporting_doc_ids', []),
+                'visible_doc_ids': list(visible_doc_ids_list[i]),
+            })
+        out_path = os.path.join(export_dir, 'leaf_evidence.json')
+        with open(out_path, 'w', encoding='utf-8') as f:
+            _json.dump(_jsonable(rows), f, ensure_ascii=False, indent=2)
+        dprint(f'exported leaf evidence to {out_path}')
+
     def run_llm_loop_tree_search(
-            self, 
-            gen_batch, 
+            self,
+            gen_batch,
             initial_input_ids: torch.Tensor,
         ) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
@@ -618,14 +676,21 @@ class LLMGenerationTreeSearchManager:
 
             # do the expansion
             self.gen_action_chain(expand_gen_batch, expansion_node_list, turns_stats)
-        
-        # step 3. Get final output 
+
+        # step 2.5 可选：分支采样前导出完整树结构（环境变量 TREE_EXPORT_DIR 门控），
+        # 用于离线核对分支在 agent-step 边界扩展与共享前缀对齐。默认关闭，不影响训练。
+        export_dir = os.environ.get('TREE_EXPORT_DIR')
+        if export_dir:
+            export_tree_roots(self.root_list, export_dir)
+
+        # step 3. Get final output
         # The order is BS x M(trees) x K(samples per tree)
         # same as final_output
         final_responses_list = []
         final_responses_with_info_mask_list = []
         final_turns_mask_list = []
         final_tree_uid_list = []
+        final_visible_doc_ids_list = []
         final_node_list = []
         for root in self.root_list:
             root.check_all_nodes_child()
@@ -638,6 +703,18 @@ class LLMGenerationTreeSearchManager:
             final_responses_with_info_mask_list.append(node.responses_with_info_mask)
             final_turns_mask_list.append(node.turns_mask)
             final_tree_uid_list.append(node.tree_uid)
+            final_visible_doc_ids_list.append(list(node.visible_doc_ids))
+
+        # 每条叶子实际进入观察的文档 ID，与 repeat 后的证据字段行序对齐，供树内证据奖励读取。
+        # 必须在下方 reward_fn 之前写入；np.empty + 切片赋值避免等长列表被压成二维 object 数组。
+        final_output.non_tensor_batch['visible_doc_ids'] = np.empty(len(final_visible_doc_ids_list), dtype=object)
+        final_output.non_tensor_batch['visible_doc_ids'][:] = final_visible_doc_ids_list
+
+        # 累计物理新生成 token（共享前缀只计一次；节点存增量 responses_with_info_mask）。
+        if self.cost_stats is not None:
+            self.cost_stats.add_physical_new_tokens(
+                physical_new_tokens_from_tree(final_node_list, self.tokenizer.pad_token_id)
+            )
 
         final_responses = self.tensor_fn.pad_and_stack(final_responses_list, pad_to_left=False)
         final_responses_with_info_mask = self.tensor_fn.pad_and_stack(final_responses_with_info_mask_list, pad_to_left=False)
@@ -701,6 +778,12 @@ class LLMGenerationTreeSearchManager:
 
         final_output.non_tensor_batch['tree_uid'] = np.array(final_tree_uid_list, dtype=object)
 
+        # 逐叶证据导出（T02/T05 真实验证，EVIDENCE_EXPORT_DIR 门控，默认关闭）：
+        # return 前把 sample_id / gold / visible_doc_ids / tree_uid 落盘，供离线核对不串题。
+        evidence_export_dir = os.environ.get('EVIDENCE_EXPORT_DIR')
+        if evidence_export_dir:
+            self._export_leaf_evidence(final_output, final_visible_doc_ids_list, evidence_export_dir)
+
         # Delete the tree
         for root in self.root_list:
             root.delete_tree_from_root()
@@ -756,13 +839,15 @@ class LLMGenerationTreeSearchManager:
         """
         cur_actions, contents = self.postprocess_predictions(predictions)
         next_obs, dones, valid_action, is_search = [], [], [], []
+        search_doc_ids = []  # 每个样本本轮实际进入观察的稳定 document.id（旁路保留）
         
         search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
         if do_search:
-            search_results = self.batch_search(search_queries)
+            search_results, search_doc_ids_per_query = self.batch_search(search_queries)
             assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
         else:
             search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
+            search_doc_ids_per_query = [[] for _ in search_results]
 
         for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
             
@@ -772,6 +857,7 @@ class LLMGenerationTreeSearchManager:
                 dones.append(0)
                 valid_action.append(0)
                 is_search.append(0)
+                search_doc_ids.append([])
             else:
                 if action == 'answer':
                     next_obs.append('')
@@ -779,12 +865,14 @@ class LLMGenerationTreeSearchManager:
                     dones.append(1)
                     valid_action.append(1)
                     is_search.append(0)
+                    search_doc_ids.append([])
                 elif action == 'search':
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
                     # Only set to 1 if done in this turn
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
+                    search_doc_ids.append(search_doc_ids_per_query.pop(0))
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
@@ -793,10 +881,12 @@ If I want to give the final answer, I should put the answer between <answer> and
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)
+                    search_doc_ids.append([])
             
         assert len(search_results) == 0
+        assert len(search_doc_ids_per_query) == 0
             
-        return next_obs, dones, valid_action, is_search
+        return next_obs, dones, valid_action, is_search, search_doc_ids
 
     def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
         """
@@ -835,11 +925,16 @@ If I want to give the final answer, I should put the answer between <answer> and
         Args:
             queries: queries to call the search engine
         Returns:
-            search results which is concatenated into a string
+            (formatted_strings, doc_ids_per_query)：
+            formatted_strings 是拼成 Agent 观察的字符串；
+            doc_ids_per_query 是每个查询返回的稳定 document.id（旁路保留，
+            供树内证据奖励按叶子统计实际可见文档）。
         """
         results = self._batch_search(queries)['result']
-        
-        return [self._passages2string(result) for result in results]
+
+        formatted = [self._passages2string(result) for result in results]
+        doc_ids = [extract_doc_ids_from_retrieval(result) for result in results]
+        return formatted, doc_ids
 
     def _batch_search(self, queries):
         
@@ -850,7 +945,7 @@ If I want to give the final answer, I should put the answer between <answer> and
         }
         
         # 统一超时、重试与错误分类（方案 §4.3），失败抛 RetrievalError。
-        return post_retrieve(self.config.search_url, payload)
+        return post_retrieve(self.config.search_url, payload, stats=self.cost_stats)
 
     def _passages2string(self, retrieval_result):
         format_reference = ''

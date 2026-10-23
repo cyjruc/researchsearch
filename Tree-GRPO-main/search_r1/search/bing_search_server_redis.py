@@ -11,6 +11,7 @@ import langid
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Union
+from dataclasses import dataclass
 
 # 引入 redis
 try:
@@ -130,6 +131,24 @@ class RedisCacheManager:
 
 # --- Core Search Engine Logic ---
 
+@dataclass
+class SearchOutcome:
+    """单次查询的结构化结果：状态 + 模型可见文本 + 旁路元数据。
+
+    ``execute`` 仍返回 ``text``（模型可见字符串，兼容现有返回形状）；
+    本结构通过 ``get_last_outcome`` 暴露，用于区分失败类型与保留 URL/标题/排名旁路。
+    """
+
+    status: str                        # success/not_found/rate_limit/network/server/invalid/auth/empty_query
+    text: str                          # 模型可见字符串
+    items: List[Dict[str, Any]]        # 旁路：[{"rank","title","url","description"}, ...]
+    error_code: Optional[str] = None   # 结构化错误码（如 HTTP 状态码字符串）
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "success"
+
+
 class OnlineSearchEngine:
     """
     Bing search tool using Brightdata API, with a high-performance Redis cache
@@ -145,10 +164,12 @@ class OnlineSearchEngine:
         result_length: int = 1000,
         location: str = "cn",
         tool_retry_count: int = 3,
+        provider: str = "brightdata",
+        cache_version: str = "v1",
     ):
         """
         Initialize the search tool.
-        
+
         Args:
             api_key: Brightdata API key.
             redis_client: An initialized Redis client instance.
@@ -157,6 +178,8 @@ class OnlineSearchEngine:
             result_length: Maximum length of each result snippet.
             location: Country code for search localization.
             tool_retry_count: Number of retries for a failed search.
+            provider: Search provider name, used in the cache key namespace.
+            cache_version: Cache format version, used in the cache key namespace.
         """
         # API configuration
         self._api_key = api_key
@@ -165,9 +188,34 @@ class OnlineSearchEngine:
         self._result_length = result_length
         self._location = location
         self._tool_retry_count = tool_retry_count
-        
+        self._provider = provider
+        self._cache_version = cache_version
+
         # Redis cache client
         self.redis_client = redis_client
+
+        # 预算口径统计：逻辑搜索、缓存命中、真实 API 请求（含重试）三者分开计数。
+        self._logical_queries = 0
+        self._cache_hits = 0
+        self._api_requests = 0
+
+        # 最近一次查询的结构化结果（旁路元数据 / 失败分类）。
+        self._last_outcome: Optional[SearchOutcome] = None
+
+    def _cache_key(self, query: str) -> str:
+        """构造带命名空间的缓存键，换 provider/zone/版本/topk 后不命中旧缓存。"""
+        return (
+            f"{self._provider}:{self._zone}:{self._cache_version}:"
+            f"{self._max_results}:{self._result_length}:{query}"
+        )
+
+    def get_stats(self) -> Dict[str, int]:
+        """返回预算口径统计：逻辑搜索、缓存命中、真实 API 请求（含重试）分开。"""
+        return {
+            "logical_queries": self._logical_queries,
+            "cache_hits": self._cache_hits,
+            "api_requests": self._api_requests,
+        }
 
     @property
     def name(self) -> str:
@@ -199,18 +247,41 @@ class OnlineSearchEngine:
             timeout: API request timeout in seconds.
 
         Returns:
-            A formatted string of search results.
+            A formatted string of search results (model-visible).
         """
+        outcome = self._execute_structured(query, timeout)
+        self._last_outcome = outcome
+        return outcome.text
+
+    def get_last_outcome(self) -> Optional[SearchOutcome]:
+        """返回最近一次查询的结构化结果（状态 / 文本 / 旁路元数据）。"""
+        return self._last_outcome
+
+    @staticmethod
+    def _classify_http_error(status_code: Optional[int]) -> str:
+        """把 HTTP 状态码归类为结构化 status（限流 / 鉴权 / 服务端 / 其他）。"""
+        if status_code in (401, 403):
+            return "auth"
+        if status_code == 429:
+            return "rate_limit"
+        if status_code is not None and status_code >= 500:
+            return "server"
+        return "invalid"
+
+    def _execute_structured(self, query: str, timeout: int = 60) -> SearchOutcome:
+        """执行一次查询，返回结构化结果；不改变模型可见返回形状。"""
         query = query.replace('"', '').strip()
         if not query:
-            return "Empty query provided."
-        
+            return SearchOutcome(status="empty_query", text="Empty query provided.", items=[])
+
         # 1. Check Redis cache first
         try:
-            cached_result = self.redis_client.get(query)
+            cached_result = self.redis_client.get(self._cache_key(query))
             if cached_result:
+                self._cache_hits += 1
                 print(f"Cache hit for query: '{query}'")
-                return cached_result
+                # 缓存只存了模型可见文本，旁路元数据不可回放，故 items 为空。
+                return SearchOutcome(status="success", text=cached_result, items=[])
         except redis.exceptions.ConnectionError as e:
             print(f"Warning: Could not connect to Redis. Proceeding without cache. Error: {e}")
         except Exception as e:
@@ -219,43 +290,63 @@ class OnlineSearchEngine:
         # 2. If not in cache, perform the search
         print(f"Cache miss for query: '{query}'. Performing live search...")
         try:
+            # 真实 HTTP 请求（含重试）在此计数，与缓存命中分开统计。
+            self._api_requests += 1
             response = self._make_request(query, timeout)
             response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
 
             data = response.json()
-            result = self._extract_and_format_results(data)
-            
-            # 3. Store the new result in Redis
+            outcome = self._extract_outcome(data)
+
+            # 3. Store the new result in Redis（仅缓存模型可见文本）。
             try:
-                # Set with an expiration time, e.g., 30 days
-                self.redis_client.set(query, result, ex=30*24*60*60)
+                self.redis_client.set(self._cache_key(query), outcome.text, ex=30*24*60*60)
             except redis.exceptions.ConnectionError as e:
                 print(f"Warning: Could not save result to Redis. Error: {e}")
-            
-            return result
+
+            return outcome
 
         except requests.exceptions.HTTPError as e:
-            error_msg = f"Bing search failed with HTTP Error: {e.response.status_code} - {e.response.text}"
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            print(f"Bing search failed with HTTP Error: {status_code}")
+            return SearchOutcome(
+                status=self._classify_http_error(status_code),
+                text="",
+                items=[],
+                error_code=str(status_code) if status_code is not None else None,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            print(f"Bing search failed with network error: {e}")
+            return SearchOutcome(status="network", text="", items=[])
         except Exception as e:
-            error_msg = f"Bing search failed with an unexpected error: {str(e)}"
-        
-        print(error_msg)
-        return "" # Return empty string on failure
+            print(f"Bing search failed with an unexpected error: {e}")
+            return SearchOutcome(status="invalid", text="", items=[])
 
-    def _extract_and_format_results(self, data: Dict) -> str:
-        """Extracts and formats search results from the API response."""
-        if 'organic' not in data:
-            return self._format_results({'chunk_content': []})
+    def _extract_outcome(self, data: Dict) -> SearchOutcome:
+        """从 API 响应提取模型可见文本与旁路元数据（rank/title/url/description）。"""
+        if 'organic' not in data or not data['organic']:
+            return SearchOutcome(status="not_found", text=self._format_results({'chunk_content': []}), items=[])
 
         chunk_content_list = []
         seen_snippets = set()
-        for result in data['organic']:
+        items: List[Dict[str, Any]] = []
+        for rank, result in enumerate(data['organic'], 1):
             snippet = result.get('description', '').strip()
+            items.append({
+                "rank": rank,
+                "title": result.get('title', '').strip(),
+                "url": result.get('link') or result.get('url') or result.get('displayed_link', ''),
+                "description": snippet,
+            })
             if snippet and snippet not in seen_snippets:
                 chunk_content_list.append(snippet)
                 seen_snippets.add(snippet)
 
-        return self._format_results({'chunk_content': chunk_content_list})
+        if not chunk_content_list:
+            # organic 存在但无可用摘要，视为真实零结果（旁路仍保留 title/url）。
+            return SearchOutcome(status="not_found", text=self._format_results({'chunk_content': []}), items=items)
+
+        return SearchOutcome(status="success", text=self._format_results({'chunk_content': chunk_content_list}), items=items)
 
     def _format_results(self, results: Dict) -> str:
         """Formats search results into a readable text block."""
@@ -271,16 +362,23 @@ class OnlineSearchEngine:
 
     def execute_with_retry(self, query: str) -> str:
         """Executes a search query with a built-in retry mechanism."""
+        # 逻辑搜索次数在此计数（每个 query 一次，内部重试不重复计）。
+        self._logical_queries += 1
         for i in range(self._tool_retry_count):
             try:
                 result_text = self.execute(query)
                 if result_text:
                     return result_text
+                # 鉴权错误不可重试，立即失败（方案 §4.3）。
+                outcome = self._last_outcome
+                if outcome is not None and outcome.status == "auth":
+                    print(f"Auth error for '{query}', not retrying.")
+                    break
                 print(f"Attempt {i+1}/{self._tool_retry_count}: Bing Search returned empty output for '{query}'. Retrying...")
             except Exception as e:
                 print(f"Attempt {i+1}/{self._tool_retry_count}: Bing Search failed for '{query}'. Error: {e}. Retrying...")
             time.sleep(1) # Wait a bit before retrying
-        
+
         print(f"All {self._tool_retry_count} retries failed for query: '{query}'")
         return f"Search failed for query: {query}"
 
@@ -331,6 +429,8 @@ if __name__ == "__main__":
     )
     parser.add_argument('--zone', type=str, default="serp_api1")
     parser.add_argument('--location', type=str, default="cn")
+    parser.add_argument('--provider', type=str, default="brightdata", help="Search provider name, used in the cache key namespace.")
+    parser.add_argument('--cache_version', type=str, default="v1", help="Cache format version, used in the cache key namespace.")
     # Search behavior args
     parser.add_argument('--max_results', type=int, default=10, help="Number of results to return per query.")
     parser.add_argument('--result_length', type=int, default=1000)
@@ -372,6 +472,8 @@ if __name__ == "__main__":
         tool_retry_count=args.tool_retry_count,
         max_results=args.max_results,
         result_length=args.result_length,
+        provider=args.provider,
+        cache_version=args.cache_version,
     )
 
     # --- API Routes ---

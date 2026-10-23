@@ -1,17 +1,17 @@
-# 树内证据奖励接线蓝图（阻塞 8 / 已知陷阱 #2）
+# 树内证据奖励接线记录（阻塞 8 / 已知陷阱 #2）
 
-更新时间：2026-10-20
+更新时间：2026-10-22
 
-本文记录证据奖励 `R_evidence` 接入树内 `reward_fn(final_output)` 的完整字段链路、
-三个丢失点与 Day 6 接线方案。**本文为静态分析与蓝图，核心训练路径改动尚未落地，
-须在真实 rollout 上验证后才可标记「证据奖励已接通」。** 已交付的预备组件（纯函数
-`evidence.extract_doc_ids_from_retrieval` 与两个固定测试样例文件）不依赖 GPU。
+本文记录证据奖励 `R_evidence` 接入树内 `reward_fn(final_output)` 的字段链路、三个
+丢失点与落地实现。**无卡接线已完成并经 fixture 测试锁定**；真实 rollout 的逐叶验证
+仍待补。「截断后可见性判定」纯函数已交付并经单元测试锁定，真实 rollout 接线待接入
+（见 §6），未做项不标记为已接通。
 
 参照：《项目架构与实验设计》§2.1、§4.4；《第 1 周工程闭环开发方案》§4.2/§4.4/§6 Day 6。
 
-## 1. 现状：字段传递全链路
+## 1. 字段传递全链路
 
-数据从 parquet 到树内奖励回调，实际经过四层：
+数据从 parquet 到树内奖励回调，经过四层：
 
 ```text
 rl_dataset.__getitem__          ray_trainer_ts.fit            generation_ts.run_llm_loop_tree_search        RewardManager.__call__
@@ -24,101 +24,114 @@ row_dict(含 extra_info)  ──▶    batch.pop(...)  ──▶  gen_batch.repe
    作为 parquet 的 dict 列原样保留在 `row_dict`，并单独提取 `index`。`collate_fn`
    后 `extra_info` / `index` / `reward_model` / `data_source` 都进入
    `DataProto.non_tensor_batch`。
-2. [ray_trainer_ts.py:837-846](../verl/trainer/ppo/ray_trainer_ts.py#L837-L846)：
+2. [ray_trainer_ts.py:842-849](../verl/trainer/ppo/ray_trainer_ts.py#L842-L849)：
    `batch = DataProto.from_single_dict(batch_dict)` → `repeat(ts_m)` →
-   `uid = index.copy()` → `gen_batch = batch.pop(batch_keys=['input_ids','attention_mask','position_ids'],
-   non_tensor_batch_keys=['uid','data_source','reward_model'])`。
-   **`extra_info` 没有被 pop，进不了 `gen_batch`。**
-3. [generation_ts.py:562-563](../search_r1/llm_agent/generation_ts.py#L562-L563)：
+   `uid = index.copy()` → `gen_batch = batch.pop(...)`。**已改为在 `extra_info` 存在时
+   将其一并加入 `non_tensor_batch_keys`**（条件性，避免 `DataProto.pop` 对缺失 key 断言）。
+3. [generation_ts.py:570](../search_r1/llm_agent/generation_ts.py#L570)：
    `final_output = gen_batch.repeat(k, interleave=True)`，`non_tensor_batch` 用
    [verl/protocol.py:586-591](../verl/protocol.py#L586-L591) 的 `np.repeat(val, k)`
-   复制，因此 `uid` / `data_source` / `reward_model` 会按根样本逐份重复 `k` 次。
-4. [generation_ts.py:668](../search_r1/llm_agent/generation_ts.py#L668)：
+   复制，因此 `extra_info` 随根样本逐份重复 `k` 次，行序与叶子一一对齐。
+4. [generation_ts.py:683](../search_r1/llm_agent/generation_ts.py#L683)：
    `original_scores, _ = self.reward_fn(final_output)` 在树采样**之后、与原 batch 合并之前**
-   调用，能读到的只有 `gen_batch` 带进来的字段。
+   调用，可读到 `gen_batch` 带进来的 `extra_info` 与 rollout 写入的 `visible_doc_ids`。
 
-结论：证据字段在四个入口（`sample_id` / `supporting_doc_ids` / `evidence_status` /
-`corpus_version`）里目前一个都到不了 `final_output`。
+## 2. 三个丢失点（均已修）
 
-## 2. 三个丢失点
-
-| # | 位置 | 丢失内容 |
-|---|---|---|
-| 1 | [ray_trainer_ts.py:843-846](../verl/trainer/ppo/ray_trainer_ts.py#L843-L846) | `batch.pop` 只保留 `uid/data_source/reward_model`，`extra_info` 里的证据字段不进 `gen_batch` |
-| 2 | [generation_ts.py:855-870](../search_r1/llm_agent/generation_ts.py#L855-L870) | `_passages2string` 只用 `contents` 拼成 `Doc N(Title: ...) ...`，Wiki 返回的 `document.id` 被丢弃 |
-| 3 | [main_ppo_format_ts.py:44-98](../verl/trainer/main_ppo_format_ts.py#L44-L98) | `RewardManager.__call__` 只读 `reward_model` / `data_source` 计算答案+格式分，没有证据项 |
+| # | 位置 | 原丢失内容 | 落地改法 |
+|---|---|---|---|
+| 1 | [ray_trainer_ts.py:843-849](../verl/trainer/ppo/ray_trainer_ts.py#L843-L849) | `batch.pop` 不传 `extra_info`，证据字段进不了 `gen_batch` | 条件性把 `extra_info` 加入 `non_tensor_batch_keys` |
+| 2 | [generation_ts.py](../search_r1/llm_agent/generation_ts.py) `batch_search` / `execute_predictions` | `_passages2string` 只用 `contents`，`document.id` 被丢弃 | `batch_search` 返回 `(formatted, doc_ids)`；`TreeNode` 新增 `visible_doc_ids` 沿父链累积；`run_llm_loop_tree_search` 在 `reward_fn` 之前写入 `final_output.non_tensor_batch['visible_doc_ids']` |
+| 3 | [main_ppo_format_ts.py](../verl/trainer/main_ppo_format_ts.py) `RewardManager` | 只算答案+格式分，无证据项 | 新增 `evidence_alpha`（默认 0），逐条读 `extra_info.supporting_doc_ids` / `evidence_status` + `visible_doc_ids`，调 `compute_evidence_reward` + `combine_score_with_evidence` |
 
 ## 3. 关键不变量：叶子顺序与 final_output 行序对齐
 
 接线正确性的前提是「叶子顺序 == final_output 行序」。该对齐由两层机制共同保证：
 
-- `final_node_list` 按 root 分组：[generation_ts.py:629-634](../search_r1/llm_agent/generation_ts.py#L629-L634)
-  对每个 root `sample_leaf(k)` 后 `extend`，得到 `[root0 的 k 叶, root1 的 k 叶, ...]`；
-  [tree_node.py:145-173](../search_r1/llm_agent/tree_node.py#L145-L173) 的 `sample_leaf`
-  返回 `get_subtree_nodes` 的 BFS 顺序叶子（与 `random.shuffle` 无关）。
+- `final_node_list` 按 root 分组：对每个 root `sample_leaf(k)` 后 `extend`，得到
+  `[root0 的 k 叶, root1 的 k 叶, ...]`；`sample_leaf` 返回 `get_subtree_nodes` 的
+  BFS 顺序叶子（与 `random.shuffle` 无关）。
 - `final_output = gen_batch.repeat(k, interleave=True)` 用 `np.repeat`，行序为
   `[根样本0 ×k, 根样本1 ×k, ...]`。
 
-因此只要证据字段随 `gen_batch.repeat(k)` 传播，其第 `i` 行就与 `final_node_list[i]`
-所属的根样本一一对应（`i // k` 定位根样本）。`final_output.batch['responses']` 更是
-直接由 `final_node_list` 的 `node.responses` 拼成
-（[generation_ts.py:636-642](../search_r1/llm_agent/generation_ts.py#L636-L642)），
-对应关系由构造保证。**已由 `tests/researchsearch/test_tree_evidence_wiring.py`
-的 `test_leaf_order_aligns_with_interleaved_repeat` 锁定。**
+因此证据字段随 `gen_batch.repeat(k)` 传播后，其第 `i` 行与 `final_node_list[i]`
+所属的根样本一一对应（`i // k` 定位根样本）。`final_output.batch['responses']` 直接
+由 `final_node_list` 的 `node.responses` 拼成，对应关系由构造保证。**已由
+`tests/researchsearch/test_tree_evidence_wiring.py` 的
+`test_leaf_order_aligns_with_interleaved_repeat` 锁定。**
 
-## 4. 接线方案（Day 6，待 GPU 验证）
+## 4. 落地实现要点
 
-按最小侵入改三处，保持协议与 Agent 观察字符串不变：
+### 4.1 `extra_info` 随 gen_batch 传入（丢失点 1）
 
-### 4.1 让证据字段随 gen_batch 传入（丢失点 1）
-
-在 [ray_trainer_ts.py:843-846](../verl/trainer/ppo/ray_trainer_ts.py#L843-L846) 把
-`extra_info` 加入 `non_tensor_batch_keys`（或在其前把 `sample_id` /
-`supporting_doc_ids` / `evidence_status` / `corpus_version` 从 `extra_info` 提取为独立
-object 数组再 pop）。推荐后者：只传奖励回调需要的窄字段，避免整列 dict 随树展开重复。
+[ray_trainer_ts.py:842-849](../verl/trainer/ppo/ray_trainer_ts.py#L842-L849)：
 
 ```python
-non_tensor_batch_keys = ['uid', 'data_source', 'reward_model',
-                         'sample_id', 'supporting_doc_ids', 'evidence_status']
+non_tensor_batch_keys = ['uid', 'data_source', 'reward_model']
+if 'extra_info' in batch.non_tensor_batch:
+    non_tensor_batch_keys.append('extra_info')
+gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                      non_tensor_batch_keys=non_tensor_batch_keys)
 ```
+
+整列 `extra_info` dict 随树展开重复（每叶一份），在奖励回调内按 key 取窄字段；
+比「提取独立窄字段」改动更小，代价是 dict 列随 `k` 展开的内存开销（本周 smoke 规模可接受）。
 
 ### 4.2 旁路保留文档 ID 并逐叶收集（丢失点 2）
 
-- `_batch_search` 已返回原始 `{'result': [[...]]}`；`batch_search` 目前只取
-  `result` 交给 `_passages2string` 拼字符串。改为同时用已交付的
-  `evidence.extract_doc_ids_from_retrieval` 提取每个查询的 `document.id`，随
-  `execute_predictions` 的返回一并带回，记到该 step 生成的 `TreeNode` 上（新字段
-  `visible_doc_ids`）。
-- 「截断后可见」的语义：`_process_next_obs` 会把 observation 截断到
-  `max_obs_length`（token 级）。因此须按截断后的 observation 判断哪些文档仍完整保留，
-  被截掉的文档记入 `retrieval_hit_doc_ids`，不计入 `R_evidence` 分子
-  （方案 §4.4）。这一判定依赖文档在格式化字符串中的边界，是 Day 6 接线最细的部分，
-  不能只用「后端返回了几个」替代。
-- `run_llm_loop_tree_search` 在收集 `final_node_list` 后，按叶子顺序把每个叶子的
-  `visible_doc_ids` 挂到 `final_output.non_tensor_batch['visible_doc_ids']`（object
-  数组），与 `final_node_list` 一一对应。
+- `batch_search` 返回 `(formatted, doc_ids)`，`doc_ids` 来自
+  `evidence.extract_doc_ids_from_retrieval`（保序、跳过缺失 id）。
+- `execute_predictions` 返回 5 元组，每样本本轮的 `search_doc_ids` 随检索分支累加。
+- `TreeNode` 新增 `visible_doc_ids`（默认独立空列表），子节点构造时
+  `parent.visible_doc_ids + search_doc_ids[i]`，共享前缀检索结果自然复用。
+- `run_llm_loop_tree_search` 在收集 `final_node_list` 后、**`reward_fn` 之前**，把
+  `final_visible_doc_ids_list` 写入 `final_output.non_tensor_batch['visible_doc_ids']`
+  （`np.empty(n, dtype=object)` + 切片赋值，避免等长列表被压成二维 object 数组）。
 
 ### 4.3 奖励回调计算证据项（丢失点 3）
 
-[main_ppo_format_ts.py](../verl/trainer/main_ppo_format_ts.py) 的 `RewardManager`
-增加 `evidence_weight`（默认 0），在逐条循环里读
-`data_item.non_tensor_batch['supporting_doc_ids']` / `['evidence_status']` /
-`['visible_doc_ids']`，调用已交付的 `evidence.compute_evidence_reward`，把
-`alpha * score` 加到该条 `score`，并把 `eligible` / `num_covered` / `num_gold` 汇入
-日志。`alpha=0` 为默认，`alpha=0.1` 仅作接线验证值。
+[main_ppo_format_ts.py](../verl/trainer/main_ppo_format_ts.py) 的 `RewardManager`：
 
-## 5. 已交付的预备组件
+```python
+extra_info = data_item.non_tensor_batch.get('extra_info') or {}
+gold_doc_ids = extra_info.get('supporting_doc_ids', [])
+evidence_status = extra_info.get('evidence_status', 'mapped')
+visible_doc_ids = data_item.non_tensor_batch.get('visible_doc_ids', [])
+evidence_res = compute_evidence_reward(gold_doc_ids=gold_doc_ids,
+                                       visible_doc_ids=visible_doc_ids,
+                                       evidence_status=evidence_status)
+score = combine_score_with_evidence(score, evidence_res, self.evidence_alpha)
+```
+
+`evidence_alpha` 来自 `config.reward_model.evidence_alpha`（[ppo_trainer.yaml](../verl/trainer/config/ppo_trainer.yaml)
+新增，默认 `0.0` 关闭）。字段缺失时安全降级为证据项 0，不影响原奖励。
+
+## 5. 已交付组件与测试
 
 | 组件 | 位置 | 覆盖 |
 |---|---|---|
-| doc_id 提取纯函数 | `verl/utils/reward_score/evidence.py::extract_doc_ids_from_retrieval` | 丢失点 2 的旁路提取，保序、跳过缺失 |
-| 叶子顺序对齐测试 | `tests/researchsearch/test_tree_evidence_wiring.py` | `sample_leaf` BFS 顺序、`np.repeat` 对齐、doc_id 提取、两题不串题（6 项） |
-| 优势路由测试 | `tests/researchsearch/test_adv_routing.py` | `compute_advantage` 的 `tree`/`tree_2norm` 路由（4 项） |
+| doc_id 提取 / 证据奖励 / 加权合并 | `verl/utils/reward_score/evidence.py` | `extract_doc_ids_from_retrieval`、`compute_evidence_reward`、`combine_score_with_evidence`（纯 stdlib，无 GPU 可测） |
+| 接线不变量测试 | `tests/researchsearch/test_tree_evidence_wiring.py`（12 项） | 叶子顺序对齐、doc_id 提取、两题不串题、`combine_score_with_evidence` 的 alpha 语义、`visible_doc_ids` 默认隔离与导出拷贝、端到端证据合并 |
+| 优势路由测试 | `tests/researchsearch/test_adv_routing.py`（4 项） | `compute_advantage` 的 `tree`/`tree_2norm` 路由 |
 
-## 6. 尚待 GPU 验证（未伪报）
+## 6. 尚待验证 / 未实现（未伪报）
 
-- 真实 rollout 中 `sample_id` / `supporting_doc_ids` / `evidence_status` 确实随
-  `gen_batch.repeat` 到达树内 `reward_fn`。
-- 逐叶 `visible_doc_ids` 与 `final_node_list` 一一对应，且两题证据不同时预期分数改变、
-  不串题（方案 §6 Day 6 任务 1 验收）。
-- 截断后可见性与 `retrieval_hit` 的判定在真实 observation 上正确。
+1. **真实 rollout 验证**（需 GPU + 语料 + 检索服务）：`extra_info` 与
+   `visible_doc_ids` 在真实树采样中确实随 `gen_batch.repeat` 到达树内 `reward_fn`，
+   且两题证据不同时预期分数改变、不串题（方案 §6 Day 6 任务 1 验收）。
+2. **截断后可见性判定（判定函数已交付，真实 rollout 接线待接入）**：当前
+   `visible_doc_ids` 仍 = 后端返回的全部 doc_id（「返回即视为可见」）。方案 §4.2/§4.4
+   要求「截断后仍进入 Agent 观察才算可见」，被 `max_obs_length` 截掉的文档应记入
+   `retrieval_hit_doc_ids`、不计入分子。判定纯函数
+   `evidence.split_doc_ids_by_truncation`（`visible` 与 `retrieval_hit` 互斥划分，
+   结束位置 `<= max_obs_length` 即完整保留）已交付，并由
+   `tests/researchsearch/test_evidence.py` 的 9 项测试锁定（含前缀 offset、部分截断、
+   长度不一致抛错、端到端喂给 `compute_evidence_reward`）。**尚未接入 rollout 热路径**：
+   `execute_predictions` 的 `search_doc_ids` 仍需改为「按每个文档在格式化 observation
+   中的 token 边界 + `max_obs_length` 调 `split_doc_ids_by_truncation` 过滤」，这一步
+   需要 tokenizer 对每个 `_passages2string` 片段计数（`doc_token_lengths`）与
+   `\n\n<information>` 前缀 token 数，属真实语料/检索就绪后的接入项。
+3. **Wiki 稳定 id 前置缺口**：`extract_doc_ids_from_retrieval` 依赖
+   `document.id`，而当前 Wiki 检索器只返回 `title`/`text`/`contents`，见
+   [retrieval-contract.md](./retrieval-contract.md) §2。语料层补齐稳定 id 前，
+   真实 Wiki 证据奖励读到的 `doc_id` 恒为空。

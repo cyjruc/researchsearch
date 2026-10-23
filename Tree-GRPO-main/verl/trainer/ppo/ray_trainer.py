@@ -40,7 +40,7 @@ from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
-from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig, export_e0_trajectories
 
 WorkerType = Type[Worker]
 
@@ -537,9 +537,15 @@ class RayPPOTrainer(object):
                         )
                     
                     test_batch = test_batch.union(final_gen_batch_output)
-                    
+
                     for key in test_batch.batch.keys():
                         test_batch.batch[key] = test_batch.batch[key].long()
+
+                    # E0 逐题导出（Day 3 任务 1/2）：由环境变量 E0_EXPORT_DIR 门控，默认关闭。
+                    if os.environ.get('E0_EXPORT_DIR'):
+                        self._export_e0_trajectories(
+                            test_batch, final_gen_batch_output, os.environ['E0_EXPORT_DIR']
+                        )
                     
                     # evaluate using reward_function
                     # for certain reward function (e.g. sandbox), the generation can overlap with reward
@@ -564,6 +570,16 @@ class RayPPOTrainer(object):
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
         return metric_dict
+
+
+    def _export_e0_trajectories(self, test_batch, final_gen_batch_output, export_dir):
+        """E0 逐题导出（Day 3 任务 1/2）。
+
+        把 ``run_llm_loop`` 累积的逐题轨迹与题目元信息合并写盘，见
+        ``generation.export_e0_trajectories``。
+        """
+        trajectories = final_gen_batch_output.meta_info.get('trajectories', [])
+        return export_e0_trajectories(trajectories, test_batch.non_tensor_batch, export_dir)
 
 
     def init_workers(self):

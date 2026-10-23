@@ -24,8 +24,12 @@
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 import requests
+
+if TYPE_CHECKING:
+    from search_r1.search.cost_stats import CostStats
 
 # 方案 §4.3 初始建议：单次请求 30 秒、最多重试 2 次、指数退避。
 DEFAULT_TIMEOUT = 30.0
@@ -51,6 +55,7 @@ def post_retrieve(
     timeout: float = DEFAULT_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     backoff: float = DEFAULT_BACKOFF,
+    stats: "CostStats | None" = None,
 ) -> dict:
     """POST 检索请求并返回含 ``result`` 的 JSON dict；失败抛 ``RetrievalError``。
 
@@ -63,10 +68,18 @@ def post_retrieve(
     - ``invalid``：其他非 2xx、非法 JSON、非 dict 或缺 ``result`` 字段，立即失败。
 
     真实零结果（HTTP 200 + ``result=[]``）不是错误，正常返回。
+
+    成本口径（架构 §3 / 方案 §6.3）：传入 ``stats``（推荐 ``CostStats``）时，
+    一次调用记 1 次逻辑搜索，每次网络尝试（含重试、连接失败与超时）记 1 次实际
+    外部请求——二者分开，不因批量 query 或重试放大而混淆。默认 ``None`` 不统计。
     """
+    if stats is not None:
+        stats.logical_search()
     last_error: RetrievalError | None = None
     for attempt in range(max_retries + 1):
         try:
+            if stats is not None:
+                stats.http_request()
             response = requests.post(url, json=payload, timeout=timeout)
         except requests.exceptions.Timeout as exc:
             last_error = RetrievalError("network", f"检索超时（>{timeout}s）: {exc}")

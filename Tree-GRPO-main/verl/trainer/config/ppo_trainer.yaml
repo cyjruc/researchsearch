@@ -168,6 +168,9 @@ reward_model:
   structure_format_score: 0
   final_format_score: 0
   retrieval_score: 0
+  # 证据覆盖奖励权重（Day 6 任务 1）：R_total = R_existing + evidence_alpha * R_evidence。
+  # 默认 0 关闭；接线验证通过后按架构 §2.1 启用 alpha>0。
+  evidence_alpha: 0.0
 
 retriever:
   url: "http://127.0.0.1:8000/retrieve"

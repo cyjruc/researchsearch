@@ -18,6 +18,13 @@ def dprint(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def _to_json_value(t: Optional[torch.Tensor]):
+    """把节点上的 1-D token/mask 张量转成可 JSON 序列化的 list（None 保持 None）。"""
+    if t is None:
+        return None
+    return t.detach().cpu().tolist()
+
+
 class TreeNode:
     def __init__(
         self,
@@ -31,7 +38,8 @@ class TreeNode:
         responses_with_info_mask: Optional[torch.Tensor] = None, # responses_with_info_mask are the right_part output during rollout
         turns_mask: Optional[torch.Tensor] = None, # turn_mask are the right_part output during rollout
         log_prob_node: Optional[float] = 0.0,
-        log_prob_list: Optional[list[float]] = [],
+        log_prob_list: Optional[list[float]] = None,
+        visible_doc_ids: Optional[list[str]] = None,
         parent_node: Optional['TreeNode'] = None,
         is_root: bool = False,
         is_active: bool = True,
@@ -57,7 +65,12 @@ class TreeNode:
         self.turns_mask: torch.Tensor = turns_mask
 
         self.log_prob_node: float = log_prob_node
-        self.log_prob_list: list[float] = log_prob_list
+        # 默认 None，避免可变默认参数 [] 被所有实例共享（潜在坑：不同节点会共用一个 list）。
+        self.log_prob_list: list[float] = log_prob_list if log_prob_list is not None else []
+        # 完整可见文档 ID（从根到本节点的并集，按检索顺序）。默认 None 防可变默认
+        # 参数被所有实例共享；由 generation_ts 构造新节点时沿父链累积（共享前缀
+        # 检索结果 + 本步检索结果），供树内证据奖励按叶子读取。
+        self.visible_doc_ids: list[str] = visible_doc_ids if visible_doc_ids is not None else []
 
         self.parent_node = parent_node
         self._child_node = []
@@ -291,6 +304,40 @@ class TreeNode:
             if node.node_uid in node_child_node_uid_list:
                 dprint(f'error!! node.uid in node_child_node_uid_list!!! is_root={node.is_root}, is_leaf={node.is_leaf}, node_uid={node.node_uid}')
 
+    def to_dict(self, include_tokens: bool = False) -> dict:
+        """只读导出本节点及其子树的拓扑结构，用于离线核对分支采样（不参与训练）。
+
+        ``include_tokens=True`` 时额外带上各 1-D token/mask 张量，便于核对
+        「子节点共享父节点前缀」这一树搜索不变量（input_ids / responses 前缀一致，
+        ``<information>`` 观测块在 responses_with_info_mask 中被掩码）。
+        """
+        def _len(t: Optional[torch.Tensor]) -> int:
+            return int(t.numel()) if t is not None else 0
+
+        node = {
+            'tree_uid': self.tree_uid,
+            'node_uid': self.node_uid,
+            'depth': self.depth,
+            'is_root': self.is_root,
+            'is_leaf': self.is_leaf,
+            'is_active': self.is_active,
+            'valid_action_stats': self.valid_action_stats,
+            'valid_search_stats': self.valid_search_stats,
+            'visible_doc_ids': list(self.visible_doc_ids),
+            'original_score': self.original_score,
+            'final_score': self.final_score,
+            'n_children': len(self.child_node),
+            'input_ids_len': _len(self.input_ids),
+            'responses_len': _len(self.responses),
+        }
+        if include_tokens:
+            node['input_ids'] = _to_json_value(self.input_ids)
+            node['responses'] = _to_json_value(self.responses)
+            node['responses_with_info_mask'] = _to_json_value(self.responses_with_info_mask)
+            node['turns_mask'] = _to_json_value(self.turns_mask)
+        node['children'] = [child.to_dict(include_tokens=include_tokens) for child in self.child_node]
+        return node
+
     def delete_tree_from_root(self):
         """
         Delete the tree from root
@@ -310,5 +357,22 @@ class TreeNode:
             node.parent_node = None
 
             node.log_prob_list.clear()
+            node.visible_doc_ids.clear()
 
-        
+
+
+def export_tree_roots(root_list: List['TreeNode'], export_dir: str) -> List[str]:
+    """把每棵树在分支采样前的完整结构导出为 JSON，返回写出文件的路径列表。
+
+    仅供 ``run_llm_loop_tree_search`` 在 ``delete_tree_from_root`` 之前、环境变量
+    ``TREE_EXPORT_DIR`` 开启时调用，用于离线核对分支在 agent-step 边界的扩展与
+    共享前缀对齐。每棵树一个文件，文件名用 ``tree_uid`` 命名。
+    """
+    os.makedirs(export_dir, exist_ok=True)
+    paths = []
+    for root in root_list:
+        path = os.path.join(export_dir, f'{root.tree_uid}.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(root.to_dict(include_tokens=True), f, ensure_ascii=False, indent=2)
+        paths.append(path)
+    return paths
